@@ -1,6 +1,6 @@
 [project]
 name = "marker-pdf"
-version = "2.0.0"
+version = "2.0.0+econreferee.1"
 description = "Convert documents to markdown with high speed and accuracy."
 readme = "README.md"
 license = { text = "Apache-2.0" }
@@ -10,7 +10,7 @@ authors = [
 requires-python = ">=3.10,<4"
 keywords = ["pdf", "markdown", "ocr", "nlp"]
 dependencies = [
-    "pillow>=10.1.0,<11",
+    "pillow>=10.1.0,<13",
     "pydantic>=2.4.2,<3",
     "pydantic-settings>=2.0.3,<3",
     "transformers>=5.12.1,<6",
@@ -34,7 +34,8 @@ dependencies = [
 ]
 
 [project.urls]
-Repository = "https://github.com/datalab-to/marker"
+Repository = "https://github.com/OStypa/marker"
+Upstream = "https://github.com/datalab-to/marker/tree/947d7688c0739297a7b9eb08b1a463e3a6853981"
 
 [project.optional-dependencies]
 full = [

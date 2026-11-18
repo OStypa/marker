@@ -1,7 +1,10 @@
+# Modified for EconReferee to retain native table evidence.
 from collections import Counter
+from copy import deepcopy
 from typing import Annotated, List
 
 from bs4 import BeautifulSoup
+from pdftext.schema import Reference
 from surya.layout.schema import LayoutBox, LayoutResult
 from surya.recognition import RecognitionPredictor, _detect_repeat_loop
 
@@ -17,6 +20,38 @@ from marker.util import matrix_intersection_area
 from marker.logger import get_logger
 
 logger = get_logger()
+
+
+def _native_table_source(page, block) -> dict:
+    """Capture the complete cached page before reconstruction can change it."""
+    pdftext_page = deepcopy(page.pdftext_page)
+    if type(pdftext_page) is dict:
+        bbox = pdftext_page.get("bbox")
+        if (
+            type(bbox) is tuple
+            and len(bbox) == 4
+            and all(type(value) in {int, float} for value in bbox)
+        ):
+            pdftext_page["bbox"] = list(bbox)
+        refs = pdftext_page.get("refs")
+        if type(refs) is list:
+            for index, entry in enumerate(refs):
+                if type(entry) is Reference:
+                    refs[index] = {
+                        "type": "pdftext.schema.Reference",
+                        "fields": vars(entry),
+                    }
+
+    return {
+        "schema_version": "marker.native_table_source.v1",
+        "record_status": "available" if page.pdftext_page is not None else "unavailable",
+        "ownership_status": "unresolved",
+        "source_page_index": page.page_id,
+        "source_block_id": str(block.id),
+        "source_table_polygon": deepcopy(block.polygon.polygon),
+        "pdftext_page": pdftext_page,
+        "reconstruction_disposition": "not_attempted",
+    }
 
 
 class TableProcessor(BaseProcessor):
@@ -75,13 +110,24 @@ class TableProcessor(BaseProcessor):
         ocr_fallback = []  # (page, block) digital tables the heuristics missed
         for page in document.pages:
             for block in tables_by_page.get(page.page_id, []):
+                captured_source = block.native_table_source is None
+                if captured_source:
+                    block.native_table_source = _native_table_source(page, block)
                 # Scanned/garbled pages: the full-page OCR already produced the
                 # table HTML - trust it, don't redo.
                 if block.html:
+                    if captured_source:
+                        block.native_table_source["reconstruction_disposition"] = (
+                            "preexisting_html"
+                        )
                     self.table_stats["tables_ocr"] += 1
                     continue
 
                 html = self.reconstruct_digital_table(page, block)
+                if captured_source:
+                    block.native_table_source["reconstruction_disposition"] = (
+                        "accepted" if html else "not_accepted"
+                    )
                 if html:
                     block.structure = []
                     block.html = html

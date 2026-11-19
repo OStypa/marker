@@ -1,6 +1,7 @@
+# Modified for EconReferee to identify the fork wheel.
 [project]
 name = "marker-pdf"
-version = "2.2.1"
+version = "2.2.1+econreferee.1"
 description = "Convert documents to markdown with high speed and accuracy."
 readme = "README.md"
 license = { text = "Apache-2.0" }
@@ -34,7 +35,8 @@ dependencies = [
 ]
 
 [project.urls]
-Repository = "https://github.com/datalab-to/marker"
+Repository = "https://github.com/OStypa/marker"
+Upstream = "https://github.com/datalab-to/marker/tree/15e2cb20cfccaa0c7e1a43cb25e336c469c8c225"
 
 [project.optional-dependencies]
 full = [

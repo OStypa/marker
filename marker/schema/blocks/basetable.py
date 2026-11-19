@@ -1,4 +1,5 @@
-from typing import List
+# Modified for EconReferee to retain native table evidence.
+from typing import Any, List
 
 from marker.schema import BlockTypes
 from marker.schema.blocks import Block, BlockOutput
@@ -8,6 +9,7 @@ from marker.schema.blocks.tablecell import TableCell
 class BaseTable(Block):
     block_type: BlockTypes | None = None
     html: str | None = None
+    native_table_source: dict[str, Any] | None = None
 
     @staticmethod
     def format_cells(

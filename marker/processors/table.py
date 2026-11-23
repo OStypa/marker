@@ -12,6 +12,7 @@ from marker.ocr import IndraRecognitionPredictor, select_recognition_model
 from marker.processors import BaseProcessor
 from marker.processors.table_recon import (
     match_table_cells,
+    reconstruct_source_table,
     reconstruct_table_html,
     table_lines_from_pdftext,
 )
@@ -20,6 +21,7 @@ from marker.schema.blocks.tablecell import TableCell
 from marker.schema.document import Document
 from marker.schema.labels import block_type_to_surya_label
 from marker.schema.polygon import PolygonBox
+from marker.schema.registry import get_block_class
 from marker.util import matrix_intersection_area
 from marker.logger import get_logger
 
@@ -162,7 +164,22 @@ class TableProcessor(BaseProcessor):
                     self.table_stats["tables_ocr"] += 1
                     continue
 
-                html = self.reconstruct_digital_table(page, block)
+                lines = []
+                source_table = None
+                if (
+                    block.block_type == BlockTypes.Table
+                    and page.pdftext_page
+                    and self.mode not in {"vllm", "surya", "accurate"}
+                ):
+                    lines = table_lines_from_pdftext(
+                        page.pdftext_page, block.polygon.bbox
+                    )
+                    source_table = reconstruct_source_table(lines)
+                if source_table:
+                    html, cells = source_table
+                else:
+                    html = self.reconstruct_digital_table(page, block)
+                    cells = match_table_cells(html, lines) if html and lines else []
                 if captured:
                     block.native_table_source["reconstruction_disposition"] = (
                         "accepted" if html else "not_accepted"
@@ -171,24 +188,20 @@ class TableProcessor(BaseProcessor):
                     self._retire_child_lines(document, block)
                     block.html = html
                     block.text_extraction_method = "pdftext"
-                    if block.block_type == BlockTypes.Table and page.pdftext_page:
-                        lines = table_lines_from_pdftext(
-                            page.pdftext_page, block.polygon.bbox
-                        )
-                        for row, column, text, bbox in match_table_cells(html, lines):
-                            cell = page.add_full_block(
-                                TableCell(
-                                    page_id=page.page_id,
-                                    polygon=PolygonBox.from_bbox(list(bbox)),
-                                    row_id=row,
-                                    col_id=column,
-                                    rowspan=1,
-                                    colspan=1,
-                                    is_header=row == 0,
-                                    text_lines=[text],
-                                )
+                    for row, column, text, bbox in cells:
+                        cell = page.add_full_block(
+                            TableCell(
+                                page_id=page.page_id,
+                                polygon=PolygonBox.from_bbox(list(bbox)),
+                                row_id=row,
+                                col_id=column,
+                                rowspan=1,
+                                colspan=1,
+                                is_header=row == 0,
+                                text_lines=[text],
                             )
-                            block.add_structure(cell)
+                        )
+                        block.add_structure(cell)
                     self.table_stats["tables_pdftext"] += 1
                 else:
                     ocr_fallback.append((page, block))
@@ -203,7 +216,23 @@ class TableProcessor(BaseProcessor):
                     and not block.html
                     and not block.contained_blocks(document, (BlockTypes.TableCell,))
                 ):
-                    block.block_type = BlockTypes.Text
+                    page.replace_block(
+                        block,
+                        get_block_class(BlockTypes.Text)(
+                            page_id=block.page_id,
+                            polygon=block.polygon,
+                            structure=block.structure,
+                            text_extraction_method=block.text_extraction_method,
+                            ignore_for_output=block.ignore_for_output,
+                            replace_output_newlines=block.replace_output_newlines,
+                            source=block.source,
+                            top_k=block.top_k,
+                            layout_token_count=block.layout_token_count,
+                            metadata=block.metadata,
+                            lowres_image=block.lowres_image,
+                            highres_image=block.highres_image,
+                        ),
+                    )
 
         # Release the cached raw pdftext pages - they hold char-level data
         for page in document.pages:

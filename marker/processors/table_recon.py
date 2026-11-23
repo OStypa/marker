@@ -13,6 +13,7 @@ in PDF points, matching the shape pdftext's dictionary_output yields per line.
 
 import itertools
 import re
+from bisect import bisect_right
 from collections import Counter, defaultdict
 from html import escape
 from statistics import median
@@ -331,12 +332,12 @@ def _build_html(names, grid, has_header: bool) -> str:
 def _line_tokens(line: dict, bbox):
     """Tokenize a pdftext line into (text, x0, x1) cells inside ``bbox``.
 
-    Prefer WORD-level tokens split on intra-line character gaps: pdftext often
-    merges adjacent table cells into one span, which collapses the column
-    structure the grid heuristics rely on. Re-splitting the chars at gaps
-    wider than ~a quarter of the line height recovers per-cell tokens. Falls
-    back to raw spans when char data isn't kept."""
+    Split at gaps between visible characters using the height of the line.
+    Keep ordinary spaces inside a cell. Use spans when character data is missing.
+    """
     bx0, by0, bx1, by1 = bbox
+    line_box = line.get("bbox") or (0, 0, 0, 0)
+    gap = 0.65 * max(line_box[3] - line_box[1], 1.0)
 
     def inside(x0, y0, x1, y1):
         return bx0 <= (x0 + x1) / 2 <= bx1 and by0 <= (y0 + y1) / 2 <= by1
@@ -357,12 +358,7 @@ def _line_tokens(line: dict, bbox):
             if not ch or ch.isspace():
                 if cur is not None and not cur[0].endswith(" "):
                     cur[0] += " "
-                    cur[2] = max(cur[2], cx1)
                 continue
-            # Split threshold: ~0.65x the char height. 0.25x-0.5x mis-split words
-            # across font/style switches (e.g. "75.86 ± 11.42" or italic "n=");
-            # real cell and column gaps sit above 0.65x.
-            gap = 0.65 * max(cy1 - cy0, 1.0)
             if cur is None:
                 cur = [ch, cx0, cx1]
             elif cx0 - cur[2] > gap:
@@ -455,12 +451,7 @@ def _named_table_rows(html):
     return rows
 
 
-def match_table_cells(html, lines):
-    """Align each nonempty HTML cell to one complete source token."""
-    rows = _named_table_rows(html)
-    if not rows:
-        return []
-
+def _table_row_bands(lines):
     # Lines on the same row must share a vertical interval.
     bands = []
     for tokens, top, bottom in sorted(lines, key=lambda line: line[1:]):
@@ -478,17 +469,29 @@ def match_table_cells(html, lines):
             )
         else:
             bands.append((top, bottom, bottom, tokens))
+    return [
+        (top, bottom, sorted(tokens, key=lambda token: token[1:]))
+        for top, bottom, _, tokens in bands
+    ]
+
+
+def match_table_cells(html, lines):
+    """Align each nonempty HTML cell to one complete source token."""
+    rows = _named_table_rows(html)
+    if not rows:
+        return []
+
+    bands = _table_row_bands(lines)
     if len(rows) != len(bands):
         return []
 
     column_count = len(rows[0])
     anchors = [[] for _ in range(column_count)]
     assignments = []
-    for row, (_, _, _, tokens) in zip(rows, bands, strict=True):
+    for row, (_, _, words) in zip(rows, bands, strict=True):
         populated = [(index, text) for index, text in enumerate(row) if text]
-        if not populated or len(populated) != len(tokens):
+        if not populated or len(populated) != len(words):
             return []
-        words = sorted(tokens, key=lambda word: word[1:])
         matches = []
         for (column, text), (word, left, right) in zip(populated, words, strict=True):
             if text != " ".join(normalize("NFC", word).split()) or left >= right:
@@ -517,11 +520,134 @@ def match_table_cells(html, lines):
         return []
     return [
         (row_id, column, text, (left, top, right, bottom))
-        for row_id, (row, (top, bottom, _, _)) in enumerate(
-            zip(rows, bands, strict=True)
-        )
+        for row_id, (row, (top, bottom, _)) in enumerate(zip(rows, bands, strict=True))
         for column, (text, (left, right)) in enumerate(zip(row, observed, strict=True))
     ]
+
+
+_TABLE_VALUE = re.compile(
+    r"[+−-]?(?:\d[\d,]*(?:\.\d+)?|\.\d+)(?:[eE][+−-]?\d+)?[%*∗†‡]*"
+)
+
+
+def _source_table_columns(bands):
+    """Find column boundaries from numbered models or a right-aligned value column."""
+    numbered = []
+    for index, (_, _, tokens) in enumerate(bands):
+        models = [token for token in tokens if re.fullmatch(r"\([1-9]\d*\)", token[0])]
+        if len(models) < 2 or [token[0] for token in models] != [
+            f"({i})" for i in range(1, len(models) + 1)
+        ]:
+            continue
+        if tokens[-len(models) :] != models:
+            continue
+        if any(
+            len(previous) > len(models)
+            or any(
+                _TABLE_VALUE.fullmatch(token[0].removeprefix("(").removesuffix(")"))
+                for token in previous
+            )
+            for _, _, previous in bands[:index]
+        ):
+            continue
+        centers = [(left + right) / 2 for _, left, right in models]
+        midpoints = [(a + b) / 2 for a, b in itertools.pairwise(centers)]
+        numbered.append((index, [2 * centers[0] - midpoints[0], *midpoints]))
+    if numbered:
+        return numbered[0] if len(numbered) == 1 else None
+
+    _, _, header = bands[0]
+    if not 1 <= len(header) <= 2 or not header[-1][0][0].isalpha():
+        return None
+    numeric = []
+    labels = header[:-1]
+    for _, _, tokens in bands[1:]:
+        if len(tokens) == 2 and _TABLE_VALUE.fullmatch(tokens[1][0]):
+            labels.append(tokens[0])
+            numeric.append(tokens[1])
+        elif len(tokens) == 1 and any(char.isalpha() for char in tokens[0][0]):
+            labels.extend(tokens)
+        else:
+            return None
+    if len(numeric) < 3:
+        return None
+    right_edges = [right for _, _, right in numeric]
+    if (
+        max(right_edges) - min(right_edges)
+        > median(bottom - top for top, bottom, _ in bands) / 2
+    ):
+        return None
+    left = max(right for _, _, right in labels)
+    right = min(token[1] for token in [header[-1], *numeric])
+    return (0, [(left + right) / 2]) if left < right else None
+
+
+def reconstruct_source_table(lines):
+    """Build cells when explicit labels and native positions define the grid."""
+    bands = _table_row_bands(lines)
+    if len(bands) < 3 or not _garble_ok(lines):
+        return None
+    columns = _source_table_columns(bands)
+    if columns is None:
+        return None
+    header_index, cuts = columns
+    data = bands[header_index:]
+    if len(data) < 3:
+        return None
+    start = min(left for _, _, tokens in data for _, left, _ in tokens)
+    end = max(right for _, _, tokens in data for _, _, right in tokens)
+    edges = [start, *cuts, end]
+    if any(left >= right for left, right in itertools.pairwise(edges)):
+        return None
+    rows, cells = [], []
+    anchors = [[] for _ in cuts]
+    sparse = []
+    for row_id, (top, bottom, tokens) in enumerate(data):
+        columns = [[] for _ in range(len(edges) - 1)]
+        positions = {}
+        for text, left, right in tokens:
+            col = bisect_right(cuts, (left + right) / 2)
+            if left < edges[col] or right > edges[col + 1] or "<" in text:
+                return None
+            columns[col].append(text)
+            if col:
+                positions[col - 1] = left, right
+        row = [" ".join(text) for text in columns]
+        if row_id == 0 and (
+            any(not name for name in row[1:]) or len(set(row[1:])) < len(cuts)
+        ):
+            return None
+        if row_id > 0 and len(cuts) >= 2:
+            if any(len(tokens) > 1 for tokens in columns[1:]):
+                return None
+            if row[0] and len(positions) == len(anchors):
+                for col, extent in positions.items():
+                    anchors[col].append(extent)
+            elif len(positions) < len(anchors):
+                sparse.extend(positions.items())
+        rows.append(row)
+        cells.extend(
+            (row_id, col, text, (left, top, right, bottom))
+            for col, (text, (left, right)) in enumerate(
+                zip(row, itertools.pairwise(edges), strict=True)
+            )
+        )
+    if len(cuts) >= 2:
+        if any(not column for column in anchors):
+            return None
+        if any(
+            right <= min(start for start, _ in anchors[col])
+            or left >= max(end for _, end in anchors[col])
+            for col, (left, right) in sparse
+        ):
+            return None
+
+    # Keep headings in reading order above the labelled grid.
+    prefix = "".join(
+        f"<p>{escape(' '.join(text for text, _, _ in tokens))}</p>"
+        for _, _, tokens in bands[:header_index]
+    )
+    return prefix + _build_html(rows[0], rows[1:], True), cells
 
 
 def reconstruct_table_html(lines):

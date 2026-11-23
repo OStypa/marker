@@ -9,13 +9,89 @@ from marker.builders.ocr import OcrBuilder
 from marker.converters.pdf import PdfConverter
 import marker.models  # noqa: F401 - ensures Surya cache dir redirect in read-only HOME
 from marker.models import create_model_dict
-from marker.ocr.indra import IndraRecognitionPredictor, select_recognition_model
+from marker.ocr.indra import (
+    IndraRecognitionPredictor,
+    _recover_captioned_tables,
+    select_recognition_model,
+)
 from marker.output import text_from_rendered
 from marker.processors.equation import EquationProcessor
 from marker.processors.table import TableProcessor
 from surya.layout.schema import LayoutBox, LayoutResult
 
 DATA_DIR = Path(__file__).parent.parent / "data" / "olmocr_bench" / "pdfs"
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        "table",
+        "page_numbers",
+        "contents_title",
+        "other_column",
+        "two_titles",
+        "combined_titles",
+        "two_blocks",
+        "intervening_text",
+    ],
+)
+def test_numbered_caption_needs_one_table_with_measured_values(case):
+    title = {
+        "label": "SectionHeader",
+        "raw_label": "Section-Header",
+        "text": "TABLE 1 -- Sample means",
+        "bbox": [40, 10, 135, 20],
+    }
+    body = {
+        "label": "TableOfContents",
+        "raw_label": "Table-Of-Contents",
+        "text": "",
+        "bbox": [10, 45, 180, 115],
+    }
+    blocks = [title, body]
+    if case == "contents_title":
+        blocks.append(
+            {
+                "label": "SectionHeader",
+                "text": "List of Tables",
+                "bbox": [10, 0, 100, 8],
+            }
+        )
+    elif case == "other_column":
+        title["bbox"] = [210, 10, 305, 20]
+    elif case == "two_titles":
+        blocks.append(
+            {**title, "text": "Table 2: Other means", "bbox": [35, 22, 130, 31]}
+        )
+    elif case == "combined_titles":
+        title["text"] += "\nTable 2: Other means"
+    elif case == "two_blocks":
+        blocks.append({**body, "label": "Table", "bbox": [10, 35, 180, 112]})
+    elif case == "intervening_text":
+        blocks.append(
+            {
+                "label": "Text",
+                "text": "A separate paragraph.",
+                "bbox": [10, 23, 164, 33],
+            }
+        )
+    values = ["1", "12", "23"] if case == "page_numbers" else ["1.35", "12.7", "23.8"]
+    lines = []
+    for index, value in enumerate(values):
+        y = 49 + index * 23
+        lines.append(
+            {
+                "bbox": [12, y, 170, y + 10],
+                "spans": [
+                    {"text": "Group", "bbox": [12, y, 45, y + 10]},
+                    {"text": value, "bbox": [149, y, 170, y + 10]},
+                ],
+            }
+        )
+    _recover_captioned_tables(blocks, {"blocks": [{"lines": lines}]}, line_height=10)
+    assert body["label"] == ("Table" if case == "table" else "TableOfContents")
+    assert title["label"] == ("Caption" if case == "table" else "SectionHeader")
+    assert body["raw_label"] == "Table-Of-Contents"
 
 
 def _make_text_image(text: str = "Indra OCR High Performance Engine", size=(800, 200)) -> Image.Image:

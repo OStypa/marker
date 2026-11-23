@@ -29,6 +29,100 @@ _MATH_RE = re.compile(
     r"\$\$([\s\S]+?)\$\$|(?<!\\)\$(?!\s)([^$\n]+?)(?<![\s\\])\$"
 )
 _LIST_PREFIX_RE = re.compile(r"^\s*(?:[-*•·▪▸◦‣⁃]|\d+[.)]|[a-zA-Z][.)])\s+")
+_TABLE_CAPTION_RE = re.compile(
+    r"\btab(?:le|\.)\s+(?:(?:[A-Z]\.?)?\d+(?:\.\d+)*|[IVXLCDM]+)\s*(?:[.:]|[-–—]+)\s*\S",
+    re.IGNORECASE,
+)
+_CONTENTS_HEADING_RE = re.compile(
+    r"(?:(?:table of )?contents|list of (?:tables|figures))", re.IGNORECASE
+)
+_TABLE_NUMBER_RE = re.compile(r"[+−-]?(?:\d+(?:,\d{3})*(?:\.\d+)?|\.\d+)%?")
+
+
+def _has_numeric_table_column(lines, line_height):
+    """Require aligned measurements on separate rows with text labels."""
+    observations = []
+    for tokens, top, bottom in lines:
+        tokens = sorted(tokens, key=lambda token: token[1])
+        if len(tokens) < 2 or not any(char.isalpha() for char in tokens[0][0]):
+            continue
+        text, left, right = tokens[-1]
+        if not _TABLE_NUMBER_RE.fullmatch(text) or left - tokens[-2][2] < line_height:
+            continue
+        measured = not text.replace(",", "").isdecimal() or (
+            len(tokens) >= 3
+            and _TABLE_NUMBER_RE.fullmatch(tokens[-2][0]) is not None
+            and tokens[-2][1] - tokens[-3][2] >= line_height
+        )
+        observations.append((top, bottom, right, measured))
+    if len(observations) < 3:
+        return False
+    edge = float(np.median([right for _, _, right, _ in observations]))
+    previous_bottom = -float("inf")
+    rows = measurements = 0
+    for top, bottom, right, measured in sorted(observations):
+        if top >= previous_bottom and abs(right - edge) <= line_height:
+            previous_bottom = bottom
+            rows += 1
+            measurements += measured
+    return rows >= 3 and measurements >= 2
+
+
+def _recover_captioned_tables(blocks, pdftext_page, line_height):
+    """Recover a contents-labelled table only when its caption and numbers agree."""
+    from marker.processors.table_recon import table_lines_from_pdftext
+
+    if not pdftext_page or not any(b["label"] == "TableOfContents" for b in blocks):
+        return
+    if any(
+        _CONTENTS_HEADING_RE.fullmatch(line.strip())
+        for block in blocks
+        for line in block.get("text", "").splitlines()
+    ):
+        return
+    captions = []
+    for block in blocks:
+        if block["label"] in {"Caption", "SectionHeader", "Text"}:
+            text = block.get("text", "").strip()
+            if _TABLE_CAPTION_RE.match(text) and not _TABLE_CAPTION_RE.search(text, 1):
+                captions.append(block)
+    pairs = []
+    for block in blocks:
+        if block["label"] not in {"TableOfContents", "Table"}:
+            continue
+        x0, y0, x1, y1 = block["bbox"]
+        for caption in captions:
+            left, top, right, bottom = caption["bbox"]
+            gap = max(y0 - bottom, top - y1)
+            if (
+                x0 - line_height <= left < right <= x1 + line_height
+                and 0 <= gap <= 3 * line_height
+            ):
+                pairs.append((block, caption))
+    for block, caption in pairs:
+        if block["label"] != "TableOfContents":
+            continue
+        if sum(body is block or title is caption for body, title in pairs) != 1:
+            continue
+        if re.search(r"(?:\.[ \t]*){3}|…", block.get("text", "")):
+            continue
+        left, top, right, bottom = caption["bbox"]
+        _, y0, _, y1 = block["bbox"]
+        gap_top, gap_bottom = (bottom, y0) if bottom <= y0 else (y1, top)
+        if any(
+            candidate is not block
+            and candidate is not caption
+            and candidate["bbox"][0] < right
+            and candidate["bbox"][2] > left
+            and candidate["bbox"][1] < gap_bottom
+            and candidate["bbox"][3] > gap_top
+            for candidate in blocks
+        ):
+            continue
+        lines = table_lines_from_pdftext(pdftext_page, block["bbox"])
+        if _has_numeric_table_column(lines, line_height):
+            block["label"] = "Table"
+            caption["label"] = "Caption"
 
 
 def format_inline_html(text: str, join_lines: str = " ") -> str:
@@ -637,6 +731,9 @@ class IndraRecognitionPredictor:
                             },
                         )
 
+                _recover_captioned_tables(
+                    raw_blocks, getattr(page, "pdftext_page", None), median_h
+                )
                 layout_boxes: List[LayoutBox] = []
                 for pos, blk in enumerate(raw_blocks):
                     bx0, by0, bx1, by1 = [float(v) for v in blk["bbox"]]

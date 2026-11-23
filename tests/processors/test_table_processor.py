@@ -4,7 +4,81 @@ from bs4 import BeautifulSoup
 from marker.renderers.markdown import MarkdownRenderer
 from marker.schema import BlockTypes
 from marker.processors.table import TableProcessor
-from marker.processors.table_recon import match_table_cells
+from marker.processors.table_recon import (
+    match_table_cells,
+    reconstruct_source_table,
+    table_lines_from_pdftext,
+)
+from marker.schema.blocks.table import Table
+from marker.schema.blocks.text import Text
+from marker.schema.document import Document
+from marker.schema.groups.page import PageGroup
+from marker.schema.polygon import PolygonBox
+
+
+def test_native_tokens_separate_columns_and_keep_decimal_points():
+    chars = [
+        {"char": char, "bbox": [left, top, right, 20]}
+        for char, left, right, top in (
+            ("A", 10, 15, 10),
+            (" ", 90, 90, 20),
+            ("-", 90, 92, 18),
+            ("0", 93, 98, 10),
+            (".", 99, 100, 19),
+            ("1", 101, 106, 10),
+        )
+    ]
+    line = {"bbox": [10, 10, 106, 20], "spans": [{"chars": chars}]}
+    assert table_lines_from_pdftext(
+        {"blocks": [{"lines": [line]}]}, [0, 0, 120, 30]
+    ) == [([("A", 10, 15), ("-0.1", 90, 106)], 10, 20)]
+
+
+def test_numbered_grid_preserves_heading_and_separate_rows():
+    group = ([("Earnings", 95, 155)], 10, 20)
+    header = ([("Age", 10, 35), ("(1)", 95, 105), ("(2)", 145, 155)], 25, 35)
+    data = [
+        ([("12", 10, 20), ("-0.035", 90, 112), ("0.002", 142, 158)], 45, 55),
+        ([("(0.047)", 90, 112), ("(0.054)", 142, 158)], 65, 75),
+    ]
+    html, cells = reconstruct_source_table([group, header, *data])
+    assert html.startswith("<p>Earnings</p>")
+    assert [entry[2] for entry in cells] == [
+        "Age",
+        "(1)",
+        "(2)",
+        "12",
+        "-0.035",
+        "0.002",
+        "",
+        "(0.047)",
+        "(0.054)",
+    ]
+
+    earlier_data = (
+        [("Participants", 10, 40), ("25", 96, 104), ("30", 146, 154)],
+        10,
+        20,
+    )
+    assert reconstruct_source_table([earlier_data, header, *data]) is None
+    misplaced = ([("13", 10, 20), ("0.013", 128, 139)], 85, 95)
+    assert reconstruct_source_table([group, header, *data, misplaced]) is None
+
+
+def test_unresolved_table_keeps_evidence_and_uses_a_text_block():
+    polygon = PolygonBox.from_bbox([0, 0, 200, 150])
+    table = Table(page_id=0, block_id=0, polygon=polygon)
+    table_id = str(table.id)
+    page = PageGroup(
+        page_id=0, block_id=0, polygon=polygon, children=[table], structure=[table.id]
+    )
+    document = Document(filepath="test-table.pdf", pages=[page])
+    TableProcessor(None, config={"disable_ocr": True})(document)
+
+    assert table.removed
+    assert table.native_table_source["source_block_id"] == table_id
+    assert table.native_table_source["reconstruction_disposition"] == "not_accepted"
+    assert isinstance(page.get_block(page.structure[0]), Text)
 
 
 def test_cells_match_one_source_row_and_keep_signed_values():

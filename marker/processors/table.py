@@ -11,12 +11,15 @@ from surya.recognition import RecognitionPredictor, _detect_repeat_loop
 from marker.ocr import IndraRecognitionPredictor, select_recognition_model
 from marker.processors import BaseProcessor
 from marker.processors.table_recon import (
+    match_table_cells,
     reconstruct_table_html,
     table_lines_from_pdftext,
 )
 from marker.schema import BlockTypes
+from marker.schema.blocks.tablecell import TableCell
 from marker.schema.document import Document
 from marker.schema.labels import block_type_to_surya_label
+from marker.schema.polygon import PolygonBox
 from marker.util import matrix_intersection_area
 from marker.logger import get_logger
 
@@ -168,6 +171,24 @@ class TableProcessor(BaseProcessor):
                     self._retire_child_lines(document, block)
                     block.html = html
                     block.text_extraction_method = "pdftext"
+                    if block.block_type == BlockTypes.Table and page.pdftext_page:
+                        lines = table_lines_from_pdftext(
+                            page.pdftext_page, block.polygon.bbox
+                        )
+                        for row, column, text, bbox in match_table_cells(html, lines):
+                            cell = page.add_full_block(
+                                TableCell(
+                                    page_id=page.page_id,
+                                    polygon=PolygonBox.from_bbox(list(bbox)),
+                                    row_id=row,
+                                    col_id=column,
+                                    rowspan=1,
+                                    colspan=1,
+                                    is_header=row == 0,
+                                    text_lines=[text],
+                                )
+                            )
+                            block.add_structure(cell)
                     self.table_stats["tables_pdftext"] += 1
                 else:
                     ocr_fallback.append((page, block))

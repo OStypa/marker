@@ -16,6 +16,8 @@ import re
 from collections import Counter, defaultdict
 from html import escape
 from statistics import median
+from unicodedata import normalize
+from xml.etree.ElementTree import ParseError, fromstring
 
 MIN_CELLS_PER_ROW = 2  # a "data row" has >= this many tokens (2 supports two-column tables; the judge filters degenerate grids)
 MIN_TABLE_ROWS = 3  # need at least this many data rows to treat it as a table
@@ -413,6 +415,113 @@ def table_lines_from_pdftext(pdftext_page: dict, bbox) -> list:
                 lb = lb or [0, 0, 0, 0]
                 lines.append((toks, round(lb[1], 1), round(lb[3], 1)))
     return lines
+
+
+def _named_table_rows(html):
+    """Read plain rectangular cells with distinct column labels."""
+    try:
+        table = fromstring(html)
+    except ParseError:
+        return []
+    if table.tag != "table":
+        return []
+    rows = []
+    for group in table:
+        if group.tag not in {"tr", "thead", "tbody"}:
+            return []
+        for row in [group] if group.tag == "tr" else group:
+            tag = "td" if rows else "th"
+            if row.tag != "tr" or any(
+                cell.tag != tag or cell.attrib or len(cell) for cell in row
+            ):
+                return []
+            texts = [
+                " ".join(normalize("NFC", cell.text or "").split()) for cell in row
+            ]
+            if not texts or any("<" in text for text in texts):
+                return []
+            rows.append(texts)
+    if (
+        len(rows) < 2
+        or len(rows[0]) < 2
+        or any(len(row) != len(rows[0]) for row in rows)
+    ):
+        return []
+    labels = rows[0][1:]
+    named = all(label and label[0].isalpha() for label in labels)
+    numbered = labels == [f"({i})" for i in range(1, len(rows[0]))]
+    if not (named or numbered) or len(set(labels)) != len(labels):
+        return []
+    return rows
+
+
+def match_table_cells(html, lines):
+    """Align each nonempty HTML cell to one complete source token."""
+    rows = _named_table_rows(html)
+    if not rows:
+        return []
+
+    # Lines on the same row must share a vertical interval.
+    bands = []
+    for tokens, top, bottom in sorted(lines, key=lambda line: line[1:]):
+        if top >= bottom:
+            return []
+        if bands and top < bands[-1][1]:
+            first, last, shared_end, words = bands[-1]
+            if top >= shared_end:
+                return []
+            bands[-1] = (
+                first,
+                max(last, bottom),
+                min(shared_end, bottom),
+                words + tokens,
+            )
+        else:
+            bands.append((top, bottom, bottom, tokens))
+    if len(rows) != len(bands):
+        return []
+
+    column_count = len(rows[0])
+    anchors = [[] for _ in range(column_count)]
+    assignments = []
+    for row, (_, _, _, tokens) in zip(rows, bands, strict=True):
+        populated = [(index, text) for index, text in enumerate(row) if text]
+        if not populated or len(populated) != len(tokens):
+            return []
+        words = sorted(tokens, key=lambda word: word[1:])
+        matches = []
+        for (column, text), (word, left, right) in zip(populated, words, strict=True):
+            if text != " ".join(normalize("NFC", word).split()) or left >= right:
+                return []
+            matches.append((column, left, right))
+            if len(words) == column_count:
+                anchors[column].append((left, right))
+        assignments.append(matches)
+    if any(not column for column in anchors):
+        return []
+
+    extents = [
+        (min(left for left, _ in col), max(right for _, right in col))
+        for col in anchors
+    ]
+    observed = extents.copy()
+    for matches in assignments:
+        if len(matches) < column_count:
+            for column, left, right in matches:
+                start, end = extents[column]
+                if right <= start or left >= end:
+                    return []
+                start, end = observed[column]
+                observed[column] = (min(start, left), max(end, right))
+    if any(right >= left for (_, right), (left, _) in itertools.pairwise(observed)):
+        return []
+    return [
+        (row_id, column, text, (left, top, right, bottom))
+        for row_id, (row, (top, bottom, _, _)) in enumerate(
+            zip(rows, bands, strict=True)
+        )
+        for column, (text, (left, right)) in enumerate(zip(row, observed, strict=True))
+    ]
 
 
 def reconstruct_table_html(lines):

@@ -237,7 +237,12 @@ class Block(BaseModel):
         from marker.schema.text.span import Span
         from marker.schema.blocks.tablecell import TableCell
 
-        if not self.structure:
+        if not self.structure or (
+            getattr(self, "html", None)
+            and all(
+                child.block_type == BlockTypes.TableCell for child in self.structure
+            )
+        ):
             if isinstance(self, (Span, TableCell)):
                 return self.text
             elif getattr(self, "html", None):

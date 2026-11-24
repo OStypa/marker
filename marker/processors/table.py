@@ -10,7 +10,10 @@ from surya.recognition import RecognitionPredictor, _detect_repeat_loop
 
 from marker.ocr import IndraRecognitionPredictor, select_recognition_model
 from marker.processors import BaseProcessor
-from marker.processors.ruled_table import recover_rotated_table
+from marker.processors.ruled_table import (
+    captioned_ruled_regions,
+    recover_rotated_table,
+)
 from marker.processors.table_recon import (
     match_table_cells,
     reconstruct_source_table,
@@ -136,10 +139,8 @@ class TableProcessor(BaseProcessor):
     def __call__(self, document: Document):
         tables_by_page = self.collect_tables(document)
         total = sum(len(v) for v in tables_by_page.values())
-        if not total:
-            return
 
-        rec_model = self.get_recognition_model()
+        rec_model = self.get_recognition_model() if total else None
         use_vlm_for_digital_tables = (
             self.mode == "balanced"
             and rec_model is not None
@@ -208,12 +209,66 @@ class TableProcessor(BaseProcessor):
                         ),
                     )
 
+        if self.mode not in {"vllm", "surya", "accurate"}:
+            for page in document.pages:
+                self.recover_ruled_crops(document, page)
+        if not total and not self.table_stats["tables_ruled_crops"]:
+            return
+
         # Release the cached raw pdftext pages - they hold char-level data
         for page in document.pages:
             page.pdftext_page = None
 
         self.table_stats["tables_total"] = total
         logger.info(f"Table processing stats: {dict(self.table_stats)}")
+
+    def recover_ruled_crops(self, document, page):
+        for polygon, body, caption in captioned_ruled_regions(page):
+            tables = [
+                block
+                for block in page.contained_blocks(document, (BlockTypes.Table,))
+                if not block.removed and body.intersection_area(block.polygon) > 1
+            ]
+            if tables:
+                if len(tables) != 1:
+                    continue
+                block = tables[0]
+                overlap = body.intersection_area(block.polygon)
+                if overlap >= 0.8 * body.area or overlap < 0.9 * block.polygon.area:
+                    continue
+                block.polygon = polygon
+                packet = block.native_table_source or _native_table_source(page, block)
+                packet["source_table_polygon"] = deepcopy(polygon.polygon)
+                packet["printed_caption"] = caption
+                packet["reconstruction_disposition"] = "not_attempted"
+                block.native_table_source = packet
+            else:
+                if page.structure is None:
+                    continue
+                table_cls = get_block_class(BlockTypes.Table)
+                block = page.add_full_block(
+                    table_cls(
+                        page_id=page.page_id,
+                        polygon=polygon,
+                        text_extraction_method="pdftext",
+                        source="processor",
+                        ignore_for_output=True,
+                    )
+                )
+                block.native_table_source = {
+                    **_native_table_source(page, block),
+                    "printed_caption": caption,
+                }
+                at = next(
+                    (
+                        index
+                        for index, ref in enumerate(page.structure)
+                        if page.get_block(ref).polygon.y_start > polygon.y_start
+                    ),
+                    len(page.structure),
+                )
+                page.structure.insert(at, block.id)
+            self.table_stats["tables_ruled_crops"] += 1
 
     def collect_tables(self, document: Document) -> dict:
         return {

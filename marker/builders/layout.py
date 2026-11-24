@@ -1,3 +1,4 @@
+import re
 from typing import Annotated, Any, List
 
 import numpy as np
@@ -15,6 +16,91 @@ from marker.schema.polygon import PolygonBox
 from marker.schema.registry import get_block_class
 
 logger = get_logger()
+
+_PROOF_START = re.compile(r"^proof(?:\s+of\s+[^:\n]+)?\s*[:.]", re.IGNORECASE)
+_PROOF_TRANSITION = re.compile(r"^(?:hence|thus|therefore|where)\b", re.IGNORECASE)
+_TABLE_TITLE = re.compile(
+    r"^(?:table|tab\.)\s+(?:[A-Z]?\.?\d+(?:\.\d+)*|[IVXLCDM]+)"
+    r"(?:\s*(?:[:.\-–—]|$)|\s+\(?continued\)?)",
+    re.IGNORECASE,
+)
+_MATH_FONT = (
+    "cmmi",
+    "cmex",
+    "cmsy",
+    "msam",
+    "msbm",
+    "mtmidd",
+    "mtsyn",
+    "mtex",
+    "stixmath",
+)
+_DISPLAY_OPERATORS = set("∑∏∫√⎷∮")
+_RELATIONS = set("=≤≥<>≈≠∈")
+
+
+def _restore_native_proof_blocks(page, result, lines):
+    """Keep proof text and math out of the table reconstruction path."""
+    candidates = [
+        block for block in result.bboxes if block.label == block.raw_label == "Table"
+    ]
+    native_page = page.pdftext_page
+    if (
+        not candidates
+        or not native_page
+        or native_page.get("rotation", 0)
+        or page.lowres_image is None
+        or list(result.image_bbox) != list(page.polygon.bbox)
+    ):
+        return
+    texts = [(line, line.raw_text.strip()) for line in lines]
+    if not any(_PROOF_START.match(text) for _, text in texts) or any(
+        _TABLE_TITLE.match(text) for _, text in texts
+    ):
+        return
+
+    from marker.ocr.indra import _has_numeric_table_column
+    from marker.processors.ruled_table import _horizontal_rules
+    from marker.processors.table_recon import table_lines_from_pdftext
+
+    for block in candidates:
+        left, top, right, bottom = block.bbox
+        members = [
+            (line, text)
+            for line, text in texts
+            if text
+            and left <= line.line.polygon.center[0] <= right
+            and top <= line.line.polygon.center[1] <= bottom
+        ]
+        if not members:
+            continue
+        math = "".join(
+            span.text
+            for line, _ in members
+            for span in line.spans
+            if span.math or any(font in span.font.lower() for font in _MATH_FONT)
+        )
+        if not _RELATIONS.intersection(math) or not (
+            any(_PROOF_START.match(text) for _, text in members)
+            or (
+                sum(char in _DISPLAY_OPERATORS for char in math) >= 2
+                and any(_PROOF_TRANSITION.match(text) for _, text in members)
+            )
+        ):
+            continue
+        height = float(np.median([line.line.polygon.height for line, _ in members]))
+        if height <= 0:
+            continue
+        tokens = table_lines_from_pdftext(native_page, block.bbox)
+        if _has_numeric_table_column(tokens, height):
+            continue
+        bound = [left, max(0, top - height), right, bottom + height]
+        if any(
+            rule[2] - rule[0] >= (right - left) / 2
+            for rule in _horizontal_rules(page, bound)
+        ):
+            continue
+        block.label = block.raw_label = "Text"
 
 
 class LayoutBuilder(BaseBuilder):
@@ -121,6 +207,10 @@ class LayoutBuilder(BaseBuilder):
             ]
         else:
             layout_results = self.surya_layout(document.pages, provider)
+            for page, result in zip(document.pages, layout_results):
+                _restore_native_proof_blocks(
+                    page, result, getattr(provider, "page_lines", {}).get(page.page_id, [])
+                )
         self.add_blocks_to_pages(document.pages, layout_results)
         self.expand_layout_blocks(document)
 

@@ -1,5 +1,6 @@
 """Read a quarter-turned table with native text and visible horizontal rules."""
 
+import re
 from html import escape
 from itertools import pairwise
 from statistics import median
@@ -275,3 +276,205 @@ def recover_rotated_table(document, page, block):
         html.append("</tr>")
     html.append("</table>")
     return "".join(html), cells
+
+
+_LABEL_ONLY = re.compile(
+    r"Table\s+(?:[A-Z]?[.-]?\d+(?:\.\d+)*|[IVXLCDM]+)", re.IGNORECASE
+)
+_NOTES = re.compile(r"(?:Notes?|Sources?)\s*[:.]", re.IGNORECASE)
+
+
+def _native_lines(pdftext_page):
+    for block in pdftext_page.get("blocks", ()):
+        for line in block.get("lines", ()):
+            box = line.get("bbox")
+            text = " ".join(
+                "".join(span.get("text", "") for span in line.get("spans", ())).split()
+            )
+            if box is not None and text:
+                yield box, text
+
+
+def _value_columns(row):
+    values = []
+    for text, left, right in reversed(row):
+        if not _TABLE_VALUE.fullmatch(text.removeprefix("(").removesuffix(")")):
+            break
+        values.append(((left + right) / 2, "." in text))
+    return values
+
+
+def _aligned_value_columns(bands, allow_counts):
+    rows = [_join_words(words, bottom - top) for top, bottom, words in bands]
+    records = [_value_columns(row) for row in rows]
+    if not any(decimal for row in records for _, decimal in row):
+        if not allow_counts:
+            return []
+        records = [
+            values
+            for row, values in zip(rows, records)
+            if len(row) > len(values) >= 2 and any(char.isalpha() for char in row[0][0])
+        ]
+    anchors = max(records, key=len, default=[])
+    if len(anchors) < 2:
+        return []
+    aligned = [
+        [
+            next((i for i, (x, _) in enumerate(anchors) if abs(x - value) <= 3), -1)
+            for value, _ in row
+        ]
+        for row in records
+    ]
+    for first in range(len(anchors)):
+        for second in range(first + 1, len(anchors)):
+            if sum(first in row and second in row for row in aligned) >= 3:
+                return [x for x, _ in anchors]
+    return []
+
+
+def captioned_ruled_regions(page):
+    """Locate printed tables independently of their text reconstruction."""
+    native = page.pdftext_page
+    if not native or native.get("rotation") not in (None, 0):
+        return []
+    lines = sorted(_native_lines(native), key=lambda item: item[0][1])
+    captions = [
+        i
+        for i, (_, text) in enumerate(lines)
+        if _TABLE_CAPTION_RE.match(text) or _LABEL_ONLY.fullmatch(text)
+    ]
+    if not captions:
+        return []
+    rules = _horizontal_rules(page, page.polygon.bbox)
+    regions = []
+    for index, next_caption in pairwise([*captions, len(lines)]):
+        caption, title = lines[index]
+        cx0, cy0, cx1, cy1 = caption
+        height = cy1 - cy0
+        center = (cx0 + cx1) / 2
+        top = next(
+            (
+                rule
+                for rule in rules
+                if cy1 < rule[1] <= cy1 + 5 * height
+                and rule[2] - rule[0] >= 8 * height
+                and rule[0] - 1 <= cx0 <= cx1 <= rule[2] + 1
+                and abs((rule[0] + rule[2]) / 2 - center) <= height
+            ),
+            None,
+        )
+        if top is None:
+            continue
+        subtitle = [
+            (box, text)
+            for box, text in lines[index + 1 : next_caption]
+            if box[1] < top[1]
+        ]
+        if len(subtitle) > 2 or any(
+            not (
+                cy1 <= box[1] < box[3] <= top[1]
+                and abs((box[0] + box[2]) / 2 - center) <= height
+            )
+            for box, _ in subtitle
+        ):
+            continue
+
+        x0, y0, x1, _ = top
+        end = (
+            lines[next_caption][0][1]
+            if next_caption < len(lines)
+            else page.polygon.y_end
+        )
+        end = next(
+            (
+                box[1]
+                for box, text in lines[index + 1 : next_caption]
+                if box[1] > y0 and _NOTES.match(text)
+            ),
+            end,
+        )
+        full = [
+            rule
+            for rule in rules
+            if y0 < rule[1] < end and abs(rule[0] - x0) <= 2 and abs(rule[2] - x1) <= 2
+        ]
+        if not full:
+            continue
+
+        bottom = full[-1][3]
+        closed = bottom - y0 >= 5 * height
+        data_end = bottom if closed else end
+        if not closed:
+            # An open part must run to the page footer with complete data rows.
+            if end != page.polygon.y_end or len(full) < 2:
+                continue
+            footer = [
+                (box, text)
+                for box, text in lines[index + 1 : next_caption]
+                if box[1] > end - 0.08 * page.polygon.height
+            ]
+            if len(footer) == 1 and footer[0][1].isdecimal():
+                data_end = footer[0][0][1]
+        left, right = x0 - 1.5, x1 + 1.5
+        bands = _table_row_bands(
+            table_lines_from_pdftext(native, [left, y0, right, data_end])
+        )
+        count_header = (
+            closed
+            and len(full) >= 2
+            and any(
+                b < full[0][1]
+                and len(row := _join_words(words, b - a)) >= 3
+                and not _value_columns(row)
+                for a, b, words in bands
+            )
+        )
+        anchors = _aligned_value_columns(bands, count_header)
+        if not anchors:
+            continue
+        if not closed:
+            body = [(a, b, words) for a, b, words in bands if a > bottom]
+            if len(body) < 6 or not body or body[-1][1] < end * 0.7:
+                continue
+            if any(
+                not (values := _value_columns(_join_words(words, b - a)))
+                or any(
+                    min(abs(x - anchor) for anchor in anchors) > 3 for x, _ in values
+                )
+                for a, b, words in body
+            ):
+                continue
+            bottom = body[-1][1] + 0.5
+
+        # Reject any native line clipped across the side bounds or a paragraph
+        # that spans the data area.
+        if any(
+            box[1] < bottom
+            and box[3] > y0
+            and box[0] < right
+            and box[2] > left
+            and (
+                box[0] < left
+                or box[2] > right
+                or box[2] - box[0] > 0.75 * (right - left)
+                and len(text.split()) > 12
+            )
+            for box, text in lines
+        ):
+            continue
+        caption_boxes = [caption, *(box for box, _ in subtitle)]
+        crop_left = min(left, *(box[0] - 0.5 for box in caption_boxes))
+        crop_right = max(right, *(box[2] + 0.5 for box in caption_boxes))
+        polygon = PolygonBox.from_bbox(
+            [crop_left, cy0 - 0.5, crop_right, bottom + 0.25]
+        ).fit_to_bounds(page.polygon.bbox)
+        body_polygon = PolygonBox.from_bbox([left, y0, right, bottom])
+        regions.append((polygon, body_polygon, title))
+    return [
+        region
+        for region in regions
+        if not any(
+            region is not other and region[0].intersection_area(other[0]) > 0
+            for other in regions
+        )
+    ]

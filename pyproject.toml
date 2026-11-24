@@ -1,7 +1,7 @@
 # Modified for EconReferee to identify the fork wheel.
 [project]
 name = "marker-pdf"
-version = "2.2.1+econreferee.4"
+version = "2.2.1+econreferee.5"
 description = "Convert documents to markdown with high speed and accuracy."
 readme = "README.md"
 license = { text = "Apache-2.0" }

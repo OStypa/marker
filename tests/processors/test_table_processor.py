@@ -288,3 +288,71 @@ def test_rotated_ruled_table_retains_native_groups_and_surrounding_text(
         and cell.polygon.bbox[1] < 101 < cell.polygon.bbox[3]
     ]
     assert [(cell.row_id, cell.col_id, cell.text) for cell in owner] == [(2, 1, "-0.8")]
+
+
+@pytest.mark.parametrize("ruled, counts", [(True, False), (True, True), (False, False)])
+def test_captioned_native_crop_preserves_the_existing_text(ruled, counts):
+    from PIL import Image, ImageDraw
+
+    def native_line(text, x, y):
+        bbox = [x, y, x + 4 * len(text), y + 7]
+        return {
+            "bbox": bbox,
+            "spans": [
+                {
+                    "text": text,
+                    "chars": [
+                        {"char": char, "bbox": [x + 4 * i, y, x + 4 * i + 4, y + 7]}
+                        for i, char in enumerate(text)
+                    ],
+                }
+            ],
+        }
+
+    image = Image.new("RGB", (280, 200), "white")
+    if ruled:
+        draw = ImageDraw.Draw(image)
+        for y in (40, 59, 120):
+            draw.line((30, y, 250, y), fill="black")
+    lines = [
+        native_line("Table 2: Estimates", 102, 16),
+        native_line("A long description of the outcome by demographic group", 30, 27),
+        native_line("Outcome", 36, 46),
+        native_line("First", 140, 46),
+        native_line("Second", 198, 46),
+    ]
+    for number, y in enumerate((66, 82, 98)):
+        lines.extend(
+            [
+                native_line("Variable", 36, y),
+                native_line(str(31 + number) if counts else f"0.{number + 1}", 144, y),
+                native_line(str(41 + number) if counts else f"0.{number + 2}", 200, y),
+            ]
+        )
+    lines.append(native_line("Notes: Evidence from example data.", 35, 126))
+    native = {"rotation": 0, "blocks": [{"lines": lines}]}
+    page_box = PolygonBox.from_bbox([0, 0, 280, 200])
+    original = Text(
+        page_id=0, block_id=0, polygon=page_box, html="<p>Existing text.</p>"
+    )
+    page = PageGroup(
+        page_id=0,
+        block_id=0,
+        polygon=page_box,
+        children=[original],
+        structure=[original.id],
+        lowres_image=image,
+        pdftext_page=native,
+    )
+    document = Document(filepath="fixture.pdf", pages=[page])
+    TableProcessor(None, {"disable_ocr": True})(document)
+
+    tables = document.contained_blocks((BlockTypes.Table,))
+    assert len(tables) == int(ruled)
+    assert "Existing text." in MarkdownRenderer()(document).markdown
+    if ruled:
+        crop = tables[0]
+        assert crop.polygon.y_start < 16 and 120 < crop.polygon.y_end < 126
+        assert crop.native_table_source["printed_caption"] == "Table 2: Estimates"
+        assert crop.native_table_source["reconstruction_disposition"] == "not_attempted"
+        assert crop.native_table_source["pdftext_page"] == native

@@ -33,6 +33,10 @@ _TABLE_CAPTION_RE = re.compile(
     r"\btab(?:le|\.)\s+(?:(?:[A-Z]\.?)?\d+(?:\.\d+)*|[IVXLCDM]+)\s*(?:[.:]|[-–—]+)\s*\S",
     re.IGNORECASE,
 )
+_FIGURE_CAPTION_RE = re.compile(
+    r"\bfig(?:ure|\.)\s+(?:(?:[A-Z]\.?)?\d+(?:\.\d+)*|[IVXLCDM]+)\s*(?:[.:]|[-–—]+)\s*\S",
+    re.IGNORECASE,
+)
 _CONTENTS_HEADING_RE = re.compile(
     r"(?:(?:table of )?contents|list of (?:tables|figures))", re.IGNORECASE
 )
@@ -123,6 +127,112 @@ def _recover_captioned_tables(blocks, pdftext_page, line_height):
         if _has_numeric_table_column(lines, line_height):
             block["label"] = "Table"
             caption["label"] = "Caption"
+
+
+def _recover_embedded_figures(blocks, provider, page_id, line_height):
+    """Pair a printed figure title with one isolated native image on the same page."""
+    captions = [
+        block for block in blocks
+        if block["label"] in {"Caption", "SectionHeader", "Text"}
+        and _FIGURE_CAPTION_RE.match(block.get("text", "").strip())
+        and not _FIGURE_CAPTION_RE.search(block["text"].strip(), 1)
+    ]
+    if not captions or not hasattr(provider, "image_placements"):
+        return
+    pairs = []
+    for box, isolated in provider.image_placements(page_id):
+        x0, y0, x1, y1 = box
+        if min(x1 - x0, y1 - y0) < 4 * line_height:
+            continue
+        for caption in captions:
+            left, top, right, bottom = caption["bbox"]
+            if bottom - top > 4 * line_height:
+                continue
+            overlap = min(right, x1) - max(left, x0)
+            if overlap <= 0 or overlap < min(right - left, x1 - x0) - line_height:
+                continue
+            gap = max(top - y1, y0 - bottom)
+            if not 0 <= gap <= 3 * line_height:
+                continue
+            pairs.append((caption, box, isolated))
+    for caption, box, isolated in pairs:
+        if not isolated or sum(title is caption or image is box for title, image, _ in pairs) != 1:
+            continue
+        x0, y0, x1, y1 = box
+        if any(
+            other["label"] in {"Figure", "Picture"}
+            and other["bbox"][0] < x1 and x0 < other["bbox"][2]
+            and other["bbox"][1] < y1 and y0 < other["bbox"][3]
+            for other in blocks
+        ):
+            continue
+        top, bottom = caption["bbox"][1::2]
+        corridor_top, corridor_bottom = (bottom, y1) if bottom <= y0 else (y0, top)
+        if any(
+            other is not caption
+            and (other.get("text") or other["label"] != "Text")
+            and other["bbox"][0] < x1 and x0 < other["bbox"][2]
+            and other["bbox"][1] < corridor_bottom and corridor_top < other["bbox"][3]
+            for other in blocks
+        ):
+            continue
+        caption["label"] = caption["raw_label"] = "Caption"
+        after_caption = caption["bbox"][3] <= box[1]
+        blocks.insert(blocks.index(caption) + int(after_caption), {
+            "label": "Figure", "raw_label": "PDFImage", "bbox": box,
+        })
+
+
+def _recover_lettered_chart(blocks, provider, page_id, line_height):
+    """Replace provisional tables only when the PDF identifies one complete figure."""
+    if not hasattr(provider, "lettered_chart_bounds") or not any(
+        b["label"] == "Table" for b in blocks
+    ):
+        return
+    lines = [line.strip() for b in blocks for line in b.get("text", "").splitlines()]
+    if not all(any(line.lower().startswith(mark) for line in lines) for mark in ("(a)", "(b)")):
+        return
+    for caption in blocks:
+        text = caption.get("text", "").strip()
+        if caption["label"] not in {
+            "Text",
+            "SectionHeader",
+            "Caption",
+        } or not _FIGURE_CAPTION_RE.match(text):
+            continue
+        title, *rest = text.splitlines()
+        if rest and not (len(rest) == 1 and rest[0].strip().lower().startswith("(a)")):
+            continue
+        bounds = provider.lettered_chart_bounds(page_id, title)
+        if bounds is None:
+            continue
+        title_box, figure = bounds
+        if abs(caption["bbox"][1] - title_box[1]) > line_height:
+            continue
+        members = [
+            b
+            for b in blocks
+            if b is not caption and b["bbox"][1] < figure[3] and figure[1] < b["bbox"][3]
+        ]
+        if not any(b["label"] == "Table" for b in members) or any(
+            b["bbox"][1] < figure[1]
+            or b["bbox"][3] > figure[3]
+            or _TABLE_CAPTION_RE.search(b.get("text", ""))
+            or _FIGURE_CAPTION_RE.search(b.get("text", ""))
+            for b in members
+        ):
+            continue
+        blocks[:] = [b for b in blocks if b not in members]
+        caption.update(label="Caption", raw_label="PDFVectorTitle", text=title, bbox=title_box)
+        blocks.insert(
+            blocks.index(caption) + 1,
+            {
+                "label": "Figure",
+                "raw_label": "PDFVectorFigure",
+                "bbox": figure,
+            },
+        )
+        return
 
 
 def format_inline_html(text: str, join_lines: str = " ") -> str:
@@ -261,7 +371,8 @@ class IndraRecognitionPredictor:
         return self._engine
 
     def detect_layout(
-        self, pages, provider=None, extract_images: bool = True
+        self, pages, provider=None, extract_images: bool = True,
+        native_figures: bool | None = None,
     ) -> List[LayoutResult]:
         """Run in-process ONNX layout detection for digital or raster pages using OrderNet + detector."""
         from indra_ocr.layout_post import (
@@ -290,6 +401,8 @@ class IndraRecognitionPredictor:
             "math",
         )
 
+        if native_figures is None:
+            native_figures = extract_images
         results: List[LayoutResult] = []
         for page in pages:
             page_bbox = list(page.polygon.bbox)
@@ -661,10 +774,13 @@ class IndraRecognitionPredictor:
                                 },
                             )
 
+                if native_figures:
+                    _recover_lettered_chart(raw_blocks, provider, page.page_id, median_h)
                 fig_captions = [
                     rb
                     for rb in raw_blocks
                     if rb.get("label") == "Caption"
+                    and rb.get("raw_label") != "PDFVectorTitle"
                     and re.match(
                         r"^\s*(?:Figure|Fig\.?)\b", rb.get("text", ""), re.I
                     )
@@ -731,6 +847,8 @@ class IndraRecognitionPredictor:
                             },
                         )
 
+                if native_figures:
+                    _recover_embedded_figures(raw_blocks, provider, page.page_id, median_h)
                 _recover_captioned_tables(
                     raw_blocks, getattr(page, "pdftext_page", None), median_h
                 )

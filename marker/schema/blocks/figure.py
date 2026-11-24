@@ -1,8 +1,11 @@
+from pydantic import PrivateAttr
+
 from marker.schema import BlockTypes
 from marker.schema.blocks import Block
 
 
 class Figure(Block):
+    _has_native_bounds: bool = PrivateAttr(default=False)
     block_type: BlockTypes = BlockTypes.Figure
     description: str | None = None
     html: str | None = None

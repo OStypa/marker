@@ -175,3 +175,116 @@ def test_split_rows(pdf_document, recognition_model):
     assert table.html
     rows = BeautifulSoup(table.html, "html.parser").find_all("tr")
     assert len(rows) >= 5
+
+
+@pytest.mark.parametrize(
+    "rotation,partial_rule", [(90, False), (270, False), (90, True)]
+)
+def test_rotated_ruled_table_retains_native_groups_and_surrounding_text(
+    tmp_path, rotation, partial_rule
+):
+    import ctypes
+    import pypdfium2 as pdfium
+    from marker.providers.pdf import PdfProvider
+
+    path = tmp_path / "rotated.pdf"
+    with pdfium.PdfDocument.new() as pdf:
+        sheet = pdf.new_page(190, 300)
+        sheet.set_rotation(rotation)
+
+        def place(obj, x, y):
+            matrix = (
+                (0, 1, -1, 0, y, x)
+                if rotation == 90
+                else (0, -1, 1, 0, 190 - y, 300 - x)
+            )
+            item = pdfium.PdfObject(obj)
+            item.set_matrix(pdfium.PdfMatrix(*matrix))
+            sheet.insert_obj(item)
+
+        def text(value, x, y):
+            obj = pdfium.raw.FPDFPageObj_NewTextObj(pdf, b"Helvetica", 8)
+            utf16 = ctypes.create_string_buffer((value + "\0").encode("utf-16le"))
+            assert pdfium.raw.FPDFText_SetText(
+                obj, ctypes.cast(utf16, pdfium.raw.FPDF_WIDESTRING)
+            )
+            place(obj, x, y)
+
+        def rule(left, right, y):
+            obj = pdfium.raw.FPDFPageObj_CreateNewPath(0, 0)
+            assert pdfium.raw.FPDFPath_LineTo(obj, right - left, 0)
+            assert pdfium.raw.FPDFPath_SetDrawMode(obj, 0, 1)
+            assert pdfium.raw.FPDFPageObj_SetStrokeWidth(obj, 0.6)
+            place(obj, left, y)
+
+        text("Appendix", 25, 16)
+        text("Table B.2: Sample", 105, 46)
+        rule(18, 282, 52)
+        text("Measures", 150, 66)
+        rule(131 if partial_rule else 112, 279, 72)
+        for y, row in (
+            (86, ("Period", "Rate", "Level")),
+            (104, ("First", "-0.8", "2.10")),
+            (122, ("Second", "0.11", "1.20")),
+            (140, ("Third", "3.14", "2.30")),
+        ):
+            for x, word in zip((25, 120, 200), row):
+                text(word, x, y)
+        rule(18, 282, 153)
+        text("Note:", 25, 174)
+        text("sample.", 47, 174)
+        sheet.gen_content()
+        pdf.save(path)
+
+    with PdfProvider(str(path), {"cache_pdftext_pages": True}) as provider:
+        page = PageGroup(
+            page_id=0,
+            polygon=provider.get_page_bbox(0),
+            children=[],
+            structure=[],
+            pdftext_page=provider.raw_pdftext_pages[0],
+            lowres_image=provider.get_images([0], 96)[0],
+        )
+        table = page.add_block(Table, PolygonBox.from_bbox([12, 4, 288, 180]))
+        page.add_structure(table)
+        native_lines = provider.get_page_lines(0)
+        assigned = [line for line in native_lines if line.raw_text.strip() != "sample."]
+        assert len(assigned) == len(native_lines) - 1
+        page.merge_blocks(assigned, "pdftext")
+    original_polygon = table.polygon.polygon
+    original_page = page.pdftext_page
+    document = Document(filepath=str(path), pages=[page])
+    TableProcessor(None, config={"disable_ocr": True})(document)
+    cells = table.contained_blocks(document, (BlockTypes.TableCell,))
+    assert table.native_table_source["source_table_polygon"] == original_polygon
+    assert (
+        table.native_table_source["pdftext_page"]["blocks"] == original_page["blocks"]
+    )
+    assert table.native_table_source["ownership_status"] == "unresolved"
+    if partial_rule:
+        assert table.polygon.polygon == original_polygon
+        assert not any(cell.colspan > 1 for cell in cells)
+        return
+    assert [page.get_block(ref).block_type for ref in page.structure] == [
+        BlockTypes.Text,
+        BlockTypes.Caption,
+        BlockTypes.Table,
+        BlockTypes.Text,
+    ]
+    assert [
+        page.get_block(ref).raw_text(document)
+        for ref in (page.structure[0], page.structure[1], page.structure[-1])
+    ] == ["Appendix", "Table B.2: Sample", "Note: sample."]
+    assert 20 < table.polygon.bbox[1] < 46 and 153 <= table.polygon.bbox[3] < 170
+    assert [
+        (cell.row_id, cell.col_id, cell.colspan)
+        for cell in cells
+        if cell.text == "Measures"
+    ] == [(0, 1, 2)]
+    owner = [
+        cell
+        for cell in cells
+        if cell.polygon.bbox[0] < 128 < cell.polygon.bbox[2]
+        and cell.polygon.bbox[1] < 101 < cell.polygon.bbox[3]
+    ]
+    assert [(cell.row_id, cell.col_id, cell.text) for cell in owner] == [(2, 1, "-0.8")]

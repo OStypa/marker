@@ -441,6 +441,181 @@ class PdfProvider(BaseProvider):
             ]
         return images
 
+    def image_placements(self, idx: int) -> list[tuple[list[float], bool]]:
+        """Return competing image bounds. Only isolated, visible top-level images qualify."""
+        with self.get_doc() as doc:
+            page = doc[idx]
+            left, bottom, width, height = page.get_bbox()
+            if page.get_rotation() or left != 0 or bottom != 0:
+                return []
+            try:
+                objects = list(page.get_objects(max_depth=1))
+                image_type = pdfium_c.FPDF_PAGEOBJ_IMAGE
+                if not any(obj.type == image_type for obj in objects):
+                    return []
+                bounds = [(obj, obj.get_bounds()) for obj in objects]
+                placements = []
+                for obj, (x0, y0, x1, y1) in bounds:
+                    box = [max(0, x0), max(0, height - y1), min(width, x1), min(height, height - y0)]
+                    if box[0] >= box[2] or box[1] >= box[3]:
+                        continue
+                    if obj.type != image_type:
+                        if obj.type == pdfium_c.FPDF_PAGEOBJ_FORM and next(
+                            page.get_objects(form=obj, filter=[image_type]), None
+                        ) is not None:
+                            placements.append((box, False))
+                        continue
+                    matrix = obj.get_matrix()
+                    clip = pdfium_c.FPDFPageObj_GetClipPath(obj)
+                    active = pdfium_c.FPDF_BOOL()
+                    isolated = (
+                        0 <= x0 < x1 <= width and 0 <= y0 < y1 <= height
+                        and matrix.b == matrix.c == 0 and matrix.a > 0 and matrix.d > 0
+                        and not pdfium_c.FPDFPageObj_HasTransparency(obj)
+                        and pdfium_c.FPDFClipPath_CountPaths(clip) <= 0
+                        and pdfium_c.FPDFPageObj_GetIsActive(obj, ctypes.byref(active)) and active.value
+                        and not any(
+                            other is not obj and x0 < r and l < x1 and y0 < t and b < y1
+                            for other, (l, b, r, t) in bounds
+                        )
+                    )
+                    placements.append((box, bool(isolated)))
+                return placements
+            except PdfiumError:
+                return []
+
+    @staticmethod
+    def _has_chart_stroke(page, form):
+        """Find a visible open polyline that spans a substantial part of the panel."""
+        matrix = form.get_matrix()
+        if matrix.b != 0 or matrix.c != 0 or matrix.a <= 0 or matrix.d <= 0:
+            return False
+        left, bottom, right, top = form.get_bounds()
+        for path in page.get_objects(form=form, max_depth=1, filter=[pdfium_c.FPDF_PAGEOBJ_PATH]):
+            count = pdfium_c.FPDFPath_CountSegments(path)
+            if count < 3:
+                continue
+            x0, y0, x1, y1 = matrix.on_rect(*path.get_bounds())
+            if x1 - x0 < (right - left) / 2 or y1 - y0 < (top - bottom) / 20:
+                continue
+            fill, stroke, active = ctypes.c_int(), pdfium_c.FPDF_BOOL(), pdfium_c.FPDF_BOOL()
+            if not (
+                pdfium_c.FPDFPath_GetDrawMode(path, ctypes.byref(fill), ctypes.byref(stroke))
+                and stroke.value
+                and not fill.value
+                and pdfium_c.FPDFPageObj_GetIsActive(path, ctypes.byref(active))
+                and active.value
+                and not pdfium_c.FPDFPageObj_HasTransparency(path)
+                and pdfium_c.FPDFClipPath_CountPaths(pdfium_c.FPDFPageObj_GetClipPath(path)) <= 0
+            ):
+                continue
+            last = pdfium_c.FPDFPath_GetPathSegment(path, count - 1)
+            if pdfium_c.FPDFPathSegment_GetClose(last):
+                continue
+            transform = path.get_matrix()
+            if transform.b != 0 or transform.c != 0:
+                continue
+            previous = None
+            slopes = 0
+            for i in range(count):
+                segment = pdfium_c.FPDFPath_GetPathSegment(path, i)
+                expected = pdfium_c.FPDF_SEGMENT_MOVETO if i == 0 else pdfium_c.FPDF_SEGMENT_LINETO
+                x, y = ctypes.c_float(), ctypes.c_float()
+                if pdfium_c.FPDFPathSegment_GetType(
+                    segment
+                ) != expected or not pdfium_c.FPDFPathSegment_GetPoint(
+                    segment, ctypes.byref(x), ctypes.byref(y)
+                ):
+                    break
+                point = matrix.on_point(*transform.on_point(x.value, y.value))
+                if previous:
+                    slopes += abs(point[0] - previous[0]) >= 1 and abs(point[1] - previous[1]) >= 1
+                previous = point
+            else:
+                if slopes >= 2:
+                    return True
+        return False
+
+    def lettered_chart_bounds(self, idx: int, title: str):
+        """Check a native title followed by consecutive lettered panels in stacked PDF forms."""
+        with self.get_doc() as doc:
+            page = doc[idx]
+            left, bottom, width, height = page.get_bbox()
+            if page.get_rotation() or left != 0 or bottom != 0:
+                return None
+            try:
+                textpage = page.get_textpage()
+                objects = list(page.get_objects(max_depth=1))
+                forms = [
+                    i for i, obj in enumerate(objects) if obj.type == pdfium_c.FPDF_PAGEOBJ_FORM
+                ]
+                if not 2 <= len(forms) <= 26 or forms[0] < 2:
+                    return None
+                first = forms[0] - 2
+                if forms != list(range(first + 2, forms[-1] + 1, 2)):
+                    return None
+                boxes = []
+                labels = []
+                for i, obj in enumerate(objects[first : forms[-1] + 1]):
+                    x0, y0, x1, y1 = obj.get_bounds()
+                    active = pdfium_c.FPDF_BOOL()
+                    if not (
+                        0 <= x0 < x1 <= width
+                        and 0 <= y0 < y1 <= height
+                        and pdfium_c.FPDFPageObj_GetIsActive(obj, ctypes.byref(active))
+                        and active.value
+                        and not pdfium_c.FPDFPageObj_HasTransparency(obj)
+                        and pdfium_c.FPDFClipPath_CountPaths(pdfium_c.FPDFPageObj_GetClipPath(obj))
+                        <= 0
+                    ):
+                        return None
+                    box = [x0, height - y1, x1, height - y0]
+                    if i == 0 or i % 2:
+                        if (
+                            obj.type != pdfium_c.FPDF_PAGEOBJ_TEXT
+                            or pdfium_c.FPDFTextObj_GetTextRenderMode(obj) not in (0, 1, 2)
+                        ):
+                            return None
+                        obj.textpage = textpage
+                        printed = " ".join(obj.extract().split())
+                        if i == 0:
+                            if printed != " ".join(title.split()):
+                                return None
+                            caption = box
+                            continue
+                        letter = chr(ord("a") + len(labels))
+                        if not re.match(rf"^\({letter}\)(?:\s|$)", printed, re.I):
+                            return None
+                        labels.append(box)
+                        continue
+                    label = labels[-1]
+                    line_height = label[3] - label[1]
+                    previous = boxes[-1] if boxes else caption
+                    if not (
+                        box[0] <= label[0] < label[2] <= box[2]
+                        and abs(label[1] - box[1]) <= 2 * line_height
+                        and 0 <= box[1] - previous[3] <= 3 * line_height
+                        and box[0] < (previous[0] + previous[2]) / 2 < box[2]
+                        and self._has_chart_stroke(page, obj)
+                    ):
+                        return None
+                    boxes.append(box)
+                panels = boxes + labels
+                figure = [
+                    min(b[0] for b in panels),
+                    min(b[1] for b in panels),
+                    max(b[2] for b in panels),
+                    max(b[3] for b in panels),
+                ]
+                # Text geometry in layout can overshoot a form. Require exclusive use of this page band.
+                for obj in objects[:first] + objects[forms[-1] + 1 :]:
+                    _, y0, _, y1 = obj.get_bounds()
+                    if height - y1 < figure[3] and height - y0 > caption[1]:
+                        return None
+                return caption, figure
+            except PdfiumError:
+                return None
+
     def get_page_bbox(self, idx: int) -> PolygonBox | None:
         bbox = self.page_bboxes.get(idx)
         if bbox:

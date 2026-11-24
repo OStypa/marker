@@ -10,6 +10,7 @@ from surya.recognition import RecognitionPredictor, _detect_repeat_loop
 
 from marker.ocr import IndraRecognitionPredictor, select_recognition_model
 from marker.processors import BaseProcessor
+from marker.processors.ruled_table import recover_rotated_table
 from marker.processors.table_recon import (
     match_table_cells,
     reconstruct_source_table,
@@ -164,22 +165,7 @@ class TableProcessor(BaseProcessor):
                     self.table_stats["tables_ocr"] += 1
                     continue
 
-                lines = []
-                source_table = None
-                if (
-                    block.block_type == BlockTypes.Table
-                    and page.pdftext_page
-                    and self.mode not in {"vllm", "surya", "accurate"}
-                ):
-                    lines = table_lines_from_pdftext(
-                        page.pdftext_page, block.polygon.bbox
-                    )
-                    source_table = reconstruct_source_table(lines)
-                if source_table:
-                    html, cells = source_table
-                else:
-                    html = self.reconstruct_digital_table(page, block)
-                    cells = match_table_cells(html, lines) if html and lines else []
+                html, cell_blocks = self.digital_table_cells(document, page, block)
                 if captured:
                     block.native_table_source["reconstruction_disposition"] = (
                         "accepted" if html else "not_accepted"
@@ -188,20 +174,8 @@ class TableProcessor(BaseProcessor):
                     self._retire_child_lines(document, block)
                     block.html = html
                     block.text_extraction_method = "pdftext"
-                    for row, column, text, bbox in cells:
-                        cell = page.add_full_block(
-                            TableCell(
-                                page_id=page.page_id,
-                                polygon=PolygonBox.from_bbox(list(bbox)),
-                                row_id=row,
-                                col_id=column,
-                                rowspan=1,
-                                colspan=1,
-                                is_header=row == 0,
-                                text_lines=[text],
-                            )
-                        )
-                        block.add_structure(cell)
+                    for cell in cell_blocks:
+                        block.add_structure(page.add_full_block(cell))
                     self.table_stats["tables_pdftext"] += 1
                 else:
                     ocr_fallback.append((page, block))
@@ -246,6 +220,38 @@ class TableProcessor(BaseProcessor):
             page.page_id: page.contained_blocks(document, self.block_types)
             for page in document.pages
         }
+
+    def digital_table_cells(self, document, page, block):
+        lines = []
+        source_table = None
+        if (
+            block.block_type == BlockTypes.Table
+            and page.pdftext_page
+            and self.mode not in {"vllm", "surya", "accurate"}
+        ):
+            rotated = recover_rotated_table(document, page, block)
+            if rotated:
+                return rotated
+            lines = table_lines_from_pdftext(page.pdftext_page, block.polygon.bbox)
+            source_table = reconstruct_source_table(lines)
+        if source_table:
+            html, cells = source_table
+        else:
+            html = self.reconstruct_digital_table(page, block)
+            cells = match_table_cells(html, lines) if html and lines else []
+        return html, [
+            TableCell(
+                page_id=page.page_id,
+                polygon=PolygonBox.from_bbox(list(bbox)),
+                row_id=row,
+                col_id=column,
+                rowspan=1,
+                colspan=1,
+                is_header=row == 0,
+                text_lines=[text],
+            )
+            for row, column, text, bbox in cells
+        ]
 
     def reconstruct_digital_table(self, page, block) -> str | None:
         """Reconstruct a digital table's HTML from the cached pdftext page.

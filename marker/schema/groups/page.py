@@ -314,7 +314,7 @@ class PageGroup(Group):
                         char.page_id = self.page_id
                         self.add_full_block(char)
                         span.add_structure(char)
-            if line_polys_to_merge:
+            if line_polys_to_merge and not getattr(block, "_has_native_bounds", False):
                 block.polygon = block.polygon.merge(line_polys_to_merge)
 
     def merge_blocks(

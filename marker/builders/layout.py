@@ -190,7 +190,8 @@ class LayoutBuilder(BaseBuilder):
                 or self.mode == "balanced"
             )
             detected = self.indra_model.detect_layout(
-                active_pages, provider, extract_images=want_images
+                active_pages, provider, extract_images=want_images,
+                native_figures=self.extract_images and not self.disable_image_extraction,
             )
             for idx, res in zip(active_indices, detected):
                 results[idx] = res
@@ -204,7 +205,7 @@ class LayoutBuilder(BaseBuilder):
             expand_idxs = [
                 i
                 for i, block in enumerate(page_blocks)
-                if block.block_type in self.expand_block_types
+                if block.block_type in self.expand_block_types and not getattr(block, "_has_native_bounds", False)
             ]
             if not expand_idxs:
                 continue
@@ -288,6 +289,8 @@ class LayoutBuilder(BaseBuilder):
                 layout_block.top_k = {block_type: bbox.confidence or 1.0}
                 layout_block.layout_token_count = bbox.count
                 page.add_structure(layout_block)
+                if bbox.raw_label in {"PDFImage", "PDFVectorFigure"}:
+                    layout_block._has_native_bounds = True
 
             # Ensure page has non-empty structure
             if page.structure is None:

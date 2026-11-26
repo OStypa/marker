@@ -10,6 +10,7 @@ from surya.recognition import RecognitionPredictor, _detect_repeat_loop
 
 from marker.ocr import IndraRecognitionPredictor, select_recognition_model
 from marker.processors import BaseProcessor
+from marker.processors.printed_table_titles import printed_table_labels
 from marker.processors.ruled_table import (
     captioned_ruled_regions,
     recover_rotated_table,
@@ -269,6 +270,13 @@ class TableProcessor(BaseProcessor):
                 )
                 page.structure.insert(at, block.id)
             self.table_stats["tables_ruled_crops"] += 1
+        tables = [
+            block
+            for block in page.contained_blocks(document, (BlockTypes.Table,))
+            if not block.removed and block.native_table_source is not None
+        ]
+        for block, label in printed_table_labels(page, tables):
+            block.native_table_source.setdefault("printed_caption", label)
 
     def collect_tables(self, document: Document) -> dict:
         return {

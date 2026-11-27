@@ -28,7 +28,7 @@ class TableConverter(PdfConverter):
         BlockTypes.TableOfContents,
     )
 
-    def build_document(self, filepath: str):
+    def _build_document(self, filepath: str):
         provider_cls = provider_from_filepath(filepath)
         layout_builder = self.resolve_dependencies(self.layout_builder_class)
         # The OCR builder is disabled here, so layout can never be skipped -

@@ -1,6 +1,8 @@
 import os
+import stat
 import tempfile
 from pathlib import Path
+from threading import Lock
 
 from surya.inference import SuryaInferenceManager
 from surya.recognition import RecognitionPredictor
@@ -8,55 +10,62 @@ from surya.recognition import RecognitionPredictor
 from marker.ocr import IndraRecognitionPredictor
 
 
-def _ensure_surya_cache_writable() -> None:
-    """Redirect Surya's server lock/log directory if ~/.cache is not writable (e.g. read-only HOME containers)."""
-    default_dir = Path(os.path.expanduser("~/.cache/datalab/surya"))
-    try:
-        default_dir.mkdir(parents=True, exist_ok=True)
-        probe = default_dir / ".write_probe"
-        probe.touch()
-        probe.unlink()
-        return
-    except OSError:
+_surya_cache_lock = Lock()
+_surya_cache_path: Path | None = None
+
+
+def _check_writable_cache(path: Path) -> Path:
+    path.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryFile(dir=path):
         pass
+    return path
 
-    fallback_base = Path(
-        os.environ.get("XDG_CACHE_HOME") or tempfile.gettempdir()
-    )
-    fallback_dir = fallback_base / "datalab" / "surya"
-    fallback_dir.mkdir(parents=True, exist_ok=True)
 
-    try:
-        import surya.inference.backends.spawn as surya_spawn
-
-        surya_spawn._cache_dir = lambda: fallback_dir
-        orig_attach_or_spawn = surya_spawn.attach_or_spawn
-
-        def _patched_attach_or_spawn(*args, **kwargs):
-            old_home = os.environ.get("HOME")
-            os.environ["HOME"] = str(
-                fallback_base.parent
-                if fallback_base.name == ".cache"
-                else fallback_base
-            )
+def _surya_cache_dir() -> Path:
+    """Keep Surya's locks, sentinels, and logs in one directory per process."""
+    global _surya_cache_path
+    with _surya_cache_lock:
+        if _surya_cache_path is None:
+            default = Path.home() / ".cache" / "datalab" / "surya"
             try:
-                return orig_attach_or_spawn(*args, **kwargs)
-            finally:
-                if old_home is not None:
-                    os.environ["HOME"] = old_home
+                _surya_cache_path = _check_writable_cache(default)
+            except OSError:
+                configured = os.environ.get("XDG_CACHE_HOME")
+                if configured:
+                    fallback = (
+                        Path(configured).expanduser().absolute() / "datalab" / "surya"
+                    )
+                else:
+                    get_uid = getattr(os, "getuid", None)
+                    uid = get_uid() if get_uid else "user"
+                    fallback = Path(tempfile.gettempdir()) / f"datalab-surya-{uid}"
+                    fallback.mkdir(exist_ok=True, mode=0o700)
+                    entry = fallback.stat(follow_symlinks=False)
+                    if get_uid and (
+                        not stat.S_ISDIR(entry.st_mode)
+                        or entry.st_uid != uid
+                        or stat.S_IMODE(entry.st_mode) & 0o077
+                    ):
+                        raise PermissionError(
+                            f"Surya cache must be a private directory: {fallback}"
+                        )
+                _surya_cache_path = _check_writable_cache(fallback)
+        return _surya_cache_path
 
-        surya_spawn.attach_or_spawn = _patched_attach_or_spawn
-        try:
-            import surya.inference.backends.llamacpp as surya_llamacpp
 
-            surya_llamacpp.attach_or_spawn = _patched_attach_or_spawn
-        except Exception:
-            pass
-    except Exception:
-        pass
+def _configure_surya_cache() -> None:
+    # Surya 0.24 imports the cache resolver by name in these local backends.
+    from surya.inference.backends import llamacpp, mlx, spawn
+
+    spawn._cache_dir = llamacpp._cache_dir = mlx._cache_dir = _surya_cache_dir
 
 
-_ensure_surya_cache_writable()
+def create_inference_manager(
+    inference_backend: str | None = None, *, lazy: bool = True
+) -> SuryaInferenceManager:
+    """Build a Surya manager with Marker's server cache resolver."""
+    _configure_surya_cache()
+    return SuryaInferenceManager(method=inference_backend, lazy=lazy)
 
 
 def create_model_dict(
@@ -68,32 +77,44 @@ def create_model_dict(
     load_indra: bool = True,
     no_server: bool = False,
 ) -> dict:
-    """Build the minimal predictor set marker uses across its four modes:
-      - ``no_ocr`` (or ``disable_ocr=True``): embedded PDF text layer +
-        lightweight in-process Indra ONNX layout & reading-order head.
-      - ``fast`` / ``indra``: in-process Indra line-level ONNX OCR for any
-        garbled/missing blocks or scanned pages (no external servers).
-      - ``balanced``: smart routing — in-process Indra layout + embedded PDF
-        text when clean, with Surya VLM OCR (``recognition_model``) for
-        tables, math, and scanned/garbled pages.
-      - ``vllm`` (or ``surya`` / ``accurate``): pure VLM mode — runs full-page
-        Surya VLM OCR on every page, skipping pdftext and Indra entirely.
+    """Build Marker predictors. With ``no_server``, only Indra is available.
+
+    ``device="cpu"`` selects the CPU execution provider for Indra. Configure
+    the Surya backend separately. Marker does not set its dtype or attention.
     """
-    _ensure_surya_cache_writable()
-    manager = inference_manager or SuryaInferenceManager(method=inference_backend)
-    indra = IndraRecognitionPredictor() if load_indra else None
-    rec = RecognitionPredictor(manager)
+    if dtype is not None or attention_implementation is not None:
+        raise ValueError("Marker does not support dtype or attention_implementation.")
+    if device is not None and (
+        not load_indra or str(device) not in {"cpu", "cpu:0"}
+    ):
+        raise ValueError("Marker supports an explicit CPU device for Indra only.")
+    if no_server and (inference_manager is not None or inference_backend is not None):
+        raise ValueError("no_server cannot accept a Surya manager or backend.")
+    if inference_manager is not None and inference_backend is not None:
+        raise ValueError("Specify either inference_manager or inference_backend.")
+
+    manager = None
+    if not no_server:
+        if inference_manager is None:
+            manager = create_inference_manager(inference_backend)
+        else:
+            _configure_surya_cache()
+            manager = inference_manager
+    indra = (
+        IndraRecognitionPredictor(
+            providers=["CPUExecutionProvider"] if device is not None else None
+        )
+        if load_indra
+        else None
+    )
+    rec = RecognitionPredictor(manager) if manager is not None else None
     return {
         "inference_manager": manager,
         "recognition_model": rec,
         "layout_model": indra,
         "fast_layout_model": indra,
         "ocr_error_model": None,
-        **(
-            {"indra_model": indra}
-            if load_indra
-            else {}
-        ),
+        **({"indra_model": indra} if load_indra else {}),
     }
 
 

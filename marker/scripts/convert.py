@@ -28,7 +28,7 @@ from tqdm import tqdm
 from marker.config.parser import ConfigParser
 from marker.config.printer import CustomClickPrinter
 from marker.logger import configure_logging, get_logger
-from marker.models import create_model_dict
+from marker.models import create_inference_manager, create_model_dict
 from marker.output import output_exists, save_output
 from marker.settings import settings
 from marker.skills import get_skill_markdown, install_skill
@@ -345,9 +345,7 @@ def convert_cli(
         # Spawn (or attach to) the shared inference server from the parent
         # process so it outlives worker recycling and is cleaned up when this
         # process exits. Workers attach to it via SURYA_INFERENCE_URL.
-        from surya.inference import SuryaInferenceManager
-
-        manager = SuryaInferenceManager(lazy=False)
+        manager = create_inference_manager(lazy=False)
         server_handle = manager.backend.start()  # Idempotent, returns handle
         os.environ["SURYA_INFERENCE_URL"] = server_handle.base_url
 
@@ -372,7 +370,7 @@ def convert_cli(
     # The VLM runs on the server; workers only hold the ONNX models.
     # Keep them off the GPU in multi-worker mode - the server owns the VRAM.
     model_device = None
-    if total_processes > 1 and settings.TORCH_DEVICE_MODEL == "cuda":
+    if load_indra and total_processes > 1 and settings.TORCH_DEVICE_MODEL == "cuda":
         model_device = "cpu"
 
     cpu_cores = psutil.cpu_count(logical=False) or psutil.cpu_count(logical=True) or 2

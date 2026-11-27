@@ -1,5 +1,4 @@
 import tempfile
-from typing import Dict, Type
 
 from PIL import Image, ImageDraw
 
@@ -15,11 +14,9 @@ from marker.models import create_model_dict
 from marker.providers.registry import provider_from_filepath
 from marker.renderers.chunk import ChunkRenderer
 from marker.renderers.html import HTMLRenderer
-from marker.schema import BlockTypes
-from marker.schema.blocks import Block
 from marker.renderers.markdown import MarkdownRenderer
 from marker.renderers.json import JSONRenderer
-from marker.schema.registry import register_block_class
+from marker.schema.registry import use_block_overrides
 from marker.util import classes_to_strings, strings_to_classes
 
 
@@ -58,13 +55,7 @@ def ocr_error_model(model_dict):
 @pytest.fixture(scope="function")
 def config(request):
     config_mark = request.node.get_closest_marker("config")
-    config = config_mark.args[0] if config_mark else {}
-
-    override_map: Dict[BlockTypes, Type[Block]] = config.get("override_map", {})
-    for block_type, override_block_type in override_map.items():
-        register_block_class(block_type, override_block_type)
-
-    return config
+    return dict(config_mark.args[0]) if config_mark else {}
 
 
 @pytest.fixture(scope="session")
@@ -101,7 +92,9 @@ def temp_doc(request, pdf_dataset):
 @pytest.fixture(scope="function")
 def doc_provider(request, config, temp_doc):
     provider_cls = provider_from_filepath(temp_doc.name)
-    yield provider_cls(temp_doc.name, config)
+    with use_block_overrides(config.get("override_map", {})):
+        provider = provider_cls(temp_doc.name, config)
+    yield provider
 
 
 @pytest.fixture(scope="function")
@@ -119,8 +112,9 @@ def pdf_document(
     ocr_builder = OcrBuilder(recognition_model, config)
     builder = DocumentBuilder(config)
     structure_builder = StructureBuilder(config)
-    document = builder(doc_provider, layout_builder, line_builder, ocr_builder)
-    structure_builder(document)
+    with use_block_overrides(config.get("override_map", {})):
+        document = builder(doc_provider, layout_builder, line_builder, ocr_builder)
+        structure_builder(document)
     yield document
 
 

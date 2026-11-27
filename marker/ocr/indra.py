@@ -1396,14 +1396,11 @@ def select_recognition_model(
     - Mode 2 ('fast' / 'indra'): always uses Indra line-level ONNX OCR.
     - Mode 3 ('balanced'): uses Surya VLM OCR (for full-page OCR, tables, and math).
     - Mode 4 ('vllm' / 'surya' / 'accurate'): always uses Surya VLM OCR.
+
+    The caller sets ``full_page`` on the predictor. This selector accepts the
+    argument for compatibility because both predictors support pages and crops.
     """
     if isinstance(recognition_model, IndraRecognitionPredictor):
-        return recognition_model
-    if (
-        ocr_backend == "auto"
-        and recognition_model is not None
-        and type(recognition_model).__module__.startswith("unittest.mock")
-    ):
         return recognition_model
     if ocr_backend == "surya" or mode in ("vllm", "surya", "accurate"):
         return recognition_model

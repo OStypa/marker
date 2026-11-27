@@ -116,16 +116,10 @@ class OcrBuilder(BaseBuilder):
     def can_convert_balanced_pdftext_with_indra(
         self, provider: PdfProvider
     ) -> bool:
-        rec_model = self.get_recognition_model()
-        is_mock = (
-            rec_model is not None
-            and type(rec_model).__module__.startswith("unittest.mock")
-        )
         return bool(
             self.mode == "balanced"
             and self.ocr_full_page
             and self.indra_model is not None
-            and not is_mock
             and isinstance(provider, PdfProvider)
             and getattr(provider, "filepath", None)
             and str(provider.filepath).lower().endswith(".pdf")

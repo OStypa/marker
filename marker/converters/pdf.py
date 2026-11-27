@@ -4,7 +4,6 @@ from marker.schema.document import Document
 
 os.environ["TOKENIZERS_PARALLELISM"] = "false"  # disables a tokenizers warning
 
-from collections import defaultdict
 from typing import Annotated, Any, Dict, List, Optional, Type, Tuple, Union
 import io
 from contextlib import contextmanager
@@ -46,7 +45,7 @@ from marker.renderers.markdown import MarkdownRenderer
 from marker.settings import settings
 from marker.schema import BlockTypes
 from marker.schema.blocks import Block
-from marker.schema.registry import register_block_class
+from marker.schema.registry import use_block_overrides
 from marker.util import strings_to_classes
 from marker.processors.llm.llm_handwriting import LLMHandwritingProcessor
 from marker.services.gemini import GoogleGeminiService
@@ -67,7 +66,7 @@ class PdfConverter(BaseConverter):
         "The keys are `BlockTypes` enum values, representing the types of blocks,",
         "and the values are corresponding `Block` class implementations to use",
         "instead of the defaults.",
-    ] = defaultdict()
+    ] = {}
     use_llm: Annotated[
         bool,
         "Enable higher quality processing with LLMs.",
@@ -144,8 +143,7 @@ class PdfConverter(BaseConverter):
         self.config = config
         self.mode = config["mode"]
 
-        for block_type, override_block_type in self.override_map.items():
-            register_block_class(block_type, override_block_type)
+        self.override_map = dict(self.override_map)
 
         if processor_list is not None:
             processor_list = strings_to_classes(processor_list)
@@ -172,8 +170,8 @@ class PdfConverter(BaseConverter):
 
         self.renderer = renderer
 
-        processor_list = self.initialize_processors(processor_list)
-        self.processor_list = processor_list
+        with use_block_overrides(self.override_map):
+            self.processor_list = self.initialize_processors(processor_list)
 
         self.layout_builder_class = LayoutBuilder
         self.page_count = None  # Track how many pages were converted
@@ -201,7 +199,15 @@ class PdfConverter(BaseConverter):
             if temp_file is not None and os.path.exists(temp_file.name):
                 os.unlink(temp_file.name)
 
+    def resolve_dependencies(self, cls):
+        with use_block_overrides(self.override_map):
+            return super().resolve_dependencies(cls)
+
     def build_document(self, filepath: str) -> Document:
+        with use_block_overrides(self.override_map):
+            return self._build_document(filepath)
+
+    def _build_document(self, filepath: str) -> Document:
         provider_cls = provider_from_filepath(filepath)
         layout_builder = self.resolve_dependencies(self.layout_builder_class)
         line_builder = self.resolve_dependencies(LineBuilder)
@@ -219,7 +225,10 @@ class PdfConverter(BaseConverter):
         return document
 
     def __call__(self, filepath: str | io.BytesIO):
-        with self.filepath_to_str(filepath) as temp_path:
+        with (
+            use_block_overrides(self.override_map),
+            self.filepath_to_str(filepath) as temp_path,
+        ):
             document = self.build_document(temp_path)
             self.page_count = len(document.pages)
             renderer = self.resolve_dependencies(self.renderer)

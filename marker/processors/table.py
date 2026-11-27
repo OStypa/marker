@@ -138,6 +138,7 @@ class TableProcessor(BaseProcessor):
         block.structure = []
 
     def __call__(self, document: Document):
+        stats = Counter()
         tables_by_page = self.collect_tables(document)
         total = sum(len(v) for v in tables_by_page.values())
 
@@ -146,7 +147,6 @@ class TableProcessor(BaseProcessor):
             self.mode == "balanced"
             and rec_model is not None
             and not isinstance(rec_model, IndraRecognitionPredictor)
-            and not type(rec_model).__module__.startswith("unittest.mock")
         )
         ocr_fallback = []  # (page, block) digital tables the heuristics missed
         for page in document.pages:
@@ -164,7 +164,7 @@ class TableProcessor(BaseProcessor):
                         block.native_table_source["reconstruction_disposition"] = (
                             "preexisting_html"
                         )
-                    self.table_stats["tables_ocr"] += 1
+                    stats["tables_ocr"] += 1
                     continue
 
                 html, cell_blocks = self.digital_table_cells(document, page, block)
@@ -178,11 +178,11 @@ class TableProcessor(BaseProcessor):
                     block.text_extraction_method = "pdftext"
                     for cell in cell_blocks:
                         block.add_structure(page.add_full_block(cell))
-                    self.table_stats["tables_pdftext"] += 1
+                    stats["tables_pdftext"] += 1
                 else:
                     ocr_fallback.append((page, block))
 
-        self.run_ocr_fallback(document, ocr_fallback)
+        stats.update(self.run_ocr_fallback(document, ocr_fallback))
         self.cleanup_contained_blocks(document, tables_by_page)
 
         for page in document.pages:
@@ -212,18 +212,17 @@ class TableProcessor(BaseProcessor):
 
         if self.mode not in {"vllm", "surya", "accurate"}:
             for page in document.pages:
-                self.recover_ruled_crops(document, page)
-        if not total and not self.table_stats["tables_ruled_crops"]:
-            return
+                stats["tables_ruled_crops"] += self.recover_ruled_crops(document, page)
+        if total or stats["tables_ruled_crops"]:
+            # Native evidence already holds the data used to reconstruct tables.
+            for page in document.pages:
+                page.pdftext_page = None
+            stats["tables_total"] = total
+            logger.info(f"Table processing stats: {dict(stats)}")
+        self.table_stats = stats
 
-        # Release the cached raw pdftext pages - they hold char-level data
-        for page in document.pages:
-            page.pdftext_page = None
-
-        self.table_stats["tables_total"] = total
-        logger.info(f"Table processing stats: {dict(self.table_stats)}")
-
-    def recover_ruled_crops(self, document, page):
+    def recover_ruled_crops(self, document, page) -> int:
+        count = 0
         for polygon, body, caption in captioned_ruled_regions(page):
             tables = [
                 block
@@ -269,7 +268,7 @@ class TableProcessor(BaseProcessor):
                     len(page.structure),
                 )
                 page.structure.insert(at, block.id)
-            self.table_stats["tables_ruled_crops"] += 1
+            count += 1
         tables = [
             block
             for block in page.contained_blocks(document, (BlockTypes.Table,))
@@ -277,6 +276,7 @@ class TableProcessor(BaseProcessor):
         ]
         for block, label in printed_table_labels(page, tables):
             block.native_table_source.setdefault("printed_caption", label)
+        return count
 
     def collect_tables(self, document: Document) -> dict:
         return {
@@ -365,8 +365,9 @@ class TableProcessor(BaseProcessor):
     def run_ocr_fallback(self, document: Document, fallback: list):
         """OCR the crops of digital tables the pdftext heuristics couldn't
         resolve, with the recognition model (one box per table -> HTML)."""
+        stats = Counter()
         if not fallback or self.disable_ocr:
-            return
+            return stats
 
         images, entries = [], []
         for page, block in fallback:
@@ -402,8 +403,8 @@ class TableProcessor(BaseProcessor):
                 and type(exc).__name__ == "SpawnError"
             ):
                 if all(block.html for block, _tc in entries):
-                    self.table_stats["tables_ocr"] += len(entries)
-                    return
+                    stats["tables_ocr"] += len(entries)
+                    return stats
                 results = self.indra_model(
                     images=images, layout_results=layout_results, full_page=False
                 )
@@ -419,13 +420,14 @@ class TableProcessor(BaseProcessor):
             else:
                 html = self.clean_table_html(raw)
             if not html:
-                self.table_stats["tables_ocr_failed"] += 1
+                stats["tables_ocr_failed"] += 1
                 logger.warning(f"Table OCR failed for block {block.id}")
                 continue
             self._retire_child_lines(document, block)
             block.html = html
             block.text_extraction_method = "surya"
-            self.table_stats["tables_ocr"] += 1
+            stats["tables_ocr"] += 1
+        return stats
 
     def clean_table_html(self, html: str | None) -> str:
         if not html:

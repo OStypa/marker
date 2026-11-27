@@ -314,14 +314,9 @@ class LineBuilder(BaseBuilder):
             page.page_id: score for page, score in zip(document.pages, scores)
         }
 
-        use_mock_model = (
-            self.ocr_error_model is not None
-            and type(self.ocr_error_model).__module__.startswith("unittest.mock")
-        )
         tl_untrusted_pages = set()
         if (
             not self.disable_ocr
-            and not use_mock_model
             and getattr(provider, "filepath", None)
             and str(provider.filepath).lower().endswith(".pdf")
         ):
@@ -413,11 +408,7 @@ class LineBuilder(BaseBuilder):
         labels = ["bad"] * len(pages)
         scores = [1.0] * len(pages)
         if page_texts:
-            use_mock_model = (
-                self.ocr_error_model is not None
-                and type(self.ocr_error_model).__module__.startswith("unittest.mock")
-            )
-            if not use_mock_model:
+            if self.ocr_error_model is None:
                 for idx, txt in zip(non_empty_indices, page_texts):
                     sc = score_text_garble(txt)
                     labels[idx] = "bad" if sc >= 0.5 else "good"
@@ -643,11 +634,7 @@ class LineBuilder(BaseBuilder):
                     garbled_candidates.append((block, text))
 
         if garbled_candidates:
-            use_mock_model = (
-                self.ocr_error_model is not None
-                and type(self.ocr_error_model).__module__.startswith("unittest.mock")
-            )
-            if not use_mock_model:
+            if self.ocr_error_model is None:
                 for block, txt in garbled_candidates:
                     if score_text_garble(txt) >= 0.5:
                         block.text_extraction_method = "surya"

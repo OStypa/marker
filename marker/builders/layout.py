@@ -237,14 +237,7 @@ class LayoutBuilder(BaseBuilder):
         self, pages: List[PageGroup], provider: PdfProvider
     ) -> List[LayoutResult]:
         model = self.get_layout_model()
-        if (
-            model is not None
-            and not isinstance(model, IndraRecognitionPredictor)
-            and (
-                type(model).__module__.startswith("unittest.mock")
-                or self.mode in ("vllm", "surya", "accurate")
-            )
-        ):
+        if callable(model) and not isinstance(model, IndraRecognitionPredictor):
             model.disable_tqdm = self.disable_tqdm
             images = [p.get_image(highres=False) for p in pages]
             return model(images)

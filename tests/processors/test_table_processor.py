@@ -345,7 +345,8 @@ def test_captioned_native_crop_preserves_the_existing_text(ruled, counts):
         pdftext_page=native,
     )
     document = Document(filepath="fixture.pdf", pages=[page])
-    TableProcessor(None, {"disable_ocr": True})(document)
+    processor = TableProcessor(None, {"disable_ocr": True})
+    processor(document)
 
     tables = document.contained_blocks((BlockTypes.Table,))
     assert len(tables) == int(ruled)
@@ -356,3 +357,10 @@ def test_captioned_native_crop_preserves_the_existing_text(ruled, counts):
         assert crop.native_table_source["printed_caption"] == "Table 2: Estimates"
         assert crop.native_table_source["reconstruction_disposition"] == "not_attempted"
         assert crop.native_table_source["pdftext_page"] == native
+        assert page.pdftext_page is None
+        next_native = {"rotation": 0, "blocks": []}
+        next_page = PageGroup(page_id=0, polygon=page_box, pdftext_page=next_native)
+        processor(Document(filepath="next.pdf", pages=[next_page]))
+        assert next_page.pdftext_page == next_native
+    else:
+        assert page.pdftext_page == native

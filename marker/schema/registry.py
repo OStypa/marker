@@ -1,3 +1,6 @@
+from collections.abc import Mapping
+from contextlib import contextmanager
+from contextvars import ContextVar
 from typing import Dict, Type
 from importlib import import_module
 
@@ -39,6 +42,19 @@ from marker.schema.text import Line, Span
 from marker.schema.text.char import Char
 
 BLOCK_REGISTRY: Dict[BlockTypes, str] = {}
+_block_overrides: ContextVar[Mapping[BlockTypes, Type[Block]]] = ContextVar(
+    "block_overrides", default={}
+)
+
+
+@contextmanager
+def use_block_overrides(overrides: Mapping[BlockTypes, Type[Block]]):
+    """Use one converter's block classes for this operation."""
+    token = _block_overrides.set(overrides)
+    try:
+        yield
+    finally:
+        _block_overrides.reset(token)
 
 
 def register_block_class(block_type: BlockTypes, block_cls: Type[Block]):
@@ -46,6 +62,9 @@ def register_block_class(block_type: BlockTypes, block_cls: Type[Block]):
 
 
 def get_block_class(block_type: BlockTypes) -> Type[Block]:
+    override = _block_overrides.get().get(block_type)
+    if override is not None:
+        return override
     class_path = BLOCK_REGISTRY[block_type]
     module_name, class_name = class_path.rsplit(".", 1)
     module = import_module(module_name)

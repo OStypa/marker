@@ -2068,7 +2068,7 @@ wheels = [
 
 [[package]]
 name = "marker-pdf"
-version = "2.2.1"
+version = "2.2.1+econreferee.6"
 source = { editable = "." }
 dependencies = [
     { name = "anthropic" },
